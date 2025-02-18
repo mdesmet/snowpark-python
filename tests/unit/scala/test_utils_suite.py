@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 #
-# Copyright (c) 2012-2022 Snowflake Computing Inc. All rights reserved.
+# Copyright (c) 2012-2025 Snowflake Computing Inc. All rights reserved.
 #
+
 import logging
 import os
 import zipfile
@@ -27,7 +28,6 @@ from snowflake.snowpark._internal.utils import (
     unwrap_stage_location_single_quote,
     validate_object_name,
     warning,
-    warning_dict,
     zip_file_or_directory_to_stream,
 )
 from tests.utils import IS_WINDOWS, TestFiles
@@ -72,6 +72,30 @@ def test_calculate_checksum():
         calculate_checksum(test_files.test_file_avro)
         == "3317ed5a935104274f4c7ae12b81fac063ed252570876e3f535cd8e13d8cbbb8"
     )
+
+    # Check that a smaller chunk size returns a different size on a sufficiently larger file
+    # Default Chunk Size
+    assert (
+        calculate_checksum(test_files.test_file_with_special_characters_parquet)
+        == "45128082344751b0e35f3c4d07108a42064d2326029e7fca08a7ceb0053ead9f"
+    )
+    # Smaller Chunk Size
+    assert (
+        calculate_checksum(
+            test_files.test_file_with_special_characters_parquet, chunk_size=1024
+        )
+        == "83c9e09fcadca8637e5c29870d996dc3ef5acfc9f838ae8ae1cd1fdbae86e2dc"
+    )
+    # Read whole file
+    assert (
+        calculate_checksum(
+            test_files.test_file_with_special_characters_parquet,
+            chunk_size=1024,
+            whole_file_hash=True,
+        )
+        == "f7bb6ba7de6d458945831882d34937d9f157ccd3186423a4e70b608292ae1cef"
+    )
+
     assert (
         calculate_checksum(test_files.test_file_avro, algorithm="md5")
         == "85bd7b9363853f1815254b1cbc608c22"
@@ -79,34 +103,57 @@ def test_calculate_checksum():
     if IS_WINDOWS:
         assert (
             calculate_checksum(test_files.test_udf_directory)
-            == "dacc9a957e526063c57a9d5c03644b24dfbe0f789efa224ff1b4d88138a2a6d8"
+            == "7ff46b5f3765187c7355852811c92ff232feb2f7207a12f1ab6d0b921319643b"
         )
         assert (
             calculate_checksum(test_files.test_udf_directory, algorithm="md5")
-            == "c3988b8dcab346a2e8152e06276b4033"
+            == "f6c1984af9ece1bd68edf16ae1a7f992"
         )
     else:
         assert (
             calculate_checksum(test_files.test_udf_directory)
-            == "83582388fa5d2b2f0a71666bca88a8f11a6c0d40b20096c8aeb2fccf113d3ca6"
+            == "3a2607ef293801f59e7840f5be423d4a55edfe2ac732775dcfda01205df377f0"
         )
         assert (
             calculate_checksum(test_files.test_udf_directory, algorithm="md5")
-            == "728a79922e1b869dc9578c4f8d51cc73"
+            == "b72b61c8d5639fff8aa9a80278dba60f"
+        )
+        # Validate that hashes are different when reading whole dir.
+        # Using a sufficiently small chunk size so that the hashes differ.
+        assert (
+            calculate_checksum(test_files.test_udf_directory, chunk_size=128)
+            == "c071de824a67c083edad45c2b18729e17c50f1b13be980140437063842ea2469"
+        )
+        assert (
+            calculate_checksum(
+                test_files.test_udf_directory, chunk_size=128, whole_file_hash=True
+            )
+            == "3a2607ef293801f59e7840f5be423d4a55edfe2ac732775dcfda01205df377f0"
         )
 
 
 def test_normalize_stage_location():
     name1 = "stage"
-    assert unwrap_stage_location_single_quote(name1 + "  ") == f"@{name1}"
+    unwrap_name1 = unwrap_stage_location_single_quote(name1 + "  ")
+    assert unwrap_name1 == f"@{name1}"
     assert unwrap_stage_location_single_quote("@" + name1 + "  ") == f"@{name1}"
+    assert unwrap_stage_location_single_quote(unwrap_name1) == unwrap_name1
+
     name2 = '"DATABASE"."SCHEMA"."STAGE"'
-    assert unwrap_stage_location_single_quote(name2 + "  ") == f"@{name2}"
+    unwrap_name2 = unwrap_stage_location_single_quote(name2 + "  ")
+    assert unwrap_name2 == f"@{name2}"
     assert unwrap_stage_location_single_quote("@" + name2 + "  ") == f"@{name2}"
+    assert unwrap_stage_location_single_quote(unwrap_name2) == unwrap_name2
+
     name3 = "s t a g 'e"
-    assert unwrap_stage_location_single_quote(name3) == "@s t a g 'e"
+    unwrap_name3 = unwrap_stage_location_single_quote(name3)
+    assert unwrap_name3 == "@s t a g 'e"
+    assert unwrap_stage_location_single_quote(unwrap_name3) == unwrap_name3
+
     name4 = "' s t a g 'e'"
-    assert unwrap_stage_location_single_quote(name4) == "@ s t a g 'e"
+    unwrap_name4 = unwrap_stage_location_single_quote(name4)
+    assert unwrap_name4 == "@ s t a g 'e"
+    assert unwrap_stage_location_single_quote(unwrap_name4) == unwrap_name4
 
 
 @pytest.mark.parametrize("is_local", [True, False])
@@ -146,7 +193,6 @@ def test_zip_file_or_directory_to_stream():
     with zip_file_or_directory_to_stream(
         test_files.test_udf_py_file,
         leading_path=test_files.test_udf_directory,
-        add_init_py=True,
     ) as stream:
         check_zip_files_and_close_stream(stream, ["test_udf_file.py"])
 
@@ -154,28 +200,20 @@ def test_zip_file_or_directory_to_stream():
         test_files.test_udf_py_file,
         leading_path=os.path.dirname(test_files.test_udf_directory),
     ) as stream:
-        check_zip_files_and_close_stream(stream, ["test_udf_dir/test_udf_file.py"])
-
-    with zip_file_or_directory_to_stream(
-        test_files.test_udf_py_file,
-        leading_path=os.path.dirname(test_files.test_udf_directory),
-        add_init_py=True,
-    ) as stream:
         check_zip_files_and_close_stream(
-            stream, ["test_udf_dir/test_udf_file.py", "test_udf_dir/__init__.py"]
+            stream, ["test_udf_dir/", "test_udf_dir/test_udf_file.py"]
         )
 
     with zip_file_or_directory_to_stream(
         test_files.test_udf_py_file,
         leading_path=os.path.dirname(os.path.dirname(test_files.test_udf_directory)),
-        add_init_py=True,
     ) as stream:
         check_zip_files_and_close_stream(
             stream,
             [
+                "resources/",
+                "resources/test_udf_dir/",
                 "resources/test_udf_dir/test_udf_file.py",
-                "resources/test_udf_dir/__init__.py",
-                "resources/__init__.py",
             ],
         )
 
@@ -184,6 +222,7 @@ def test_zip_file_or_directory_to_stream():
             stream,
             [
                 "test_udf_dir/",
+                "test_udf_dir/test_another_udf_file.py",
                 "test_udf_dir/test_pandas_udf_file.py",
                 "test_udf_dir/test_udf_file.py",
             ],
@@ -192,12 +231,12 @@ def test_zip_file_or_directory_to_stream():
     with zip_file_or_directory_to_stream(
         test_files.test_udf_directory,
         leading_path=os.path.dirname(test_files.test_udf_directory),
-        add_init_py=True,
     ) as stream:
         check_zip_files_and_close_stream(
             stream,
             [
                 "test_udf_dir/",
+                "test_udf_dir/test_another_udf_file.py",
                 "test_udf_dir/test_pandas_udf_file.py",
                 "test_udf_dir/test_udf_file.py",
             ],
@@ -206,29 +245,29 @@ def test_zip_file_or_directory_to_stream():
     with zip_file_or_directory_to_stream(
         test_files.test_udf_directory,
         leading_path=os.path.dirname(os.path.dirname(test_files.test_udf_directory)),
-        add_init_py=True,
     ) as stream:
         check_zip_files_and_close_stream(
             stream,
             [
+                "resources/",
                 "resources/test_udf_dir/",
+                "resources/test_udf_dir/test_another_udf_file.py",
                 "resources/test_udf_dir/test_pandas_udf_file.py",
                 "resources/test_udf_dir/test_udf_file.py",
-                "resources/__init__.py",
             ],
         )
 
     with zip_file_or_directory_to_stream(
         test_files.test_udtf_directory,
         leading_path=os.path.dirname(os.path.dirname(test_files.test_udtf_directory)),
-        add_init_py=True,
     ) as stream:
         check_zip_files_and_close_stream(
             stream,
             [
+                "resources/",
                 "resources/test_udtf_dir/",
                 "resources/test_udtf_dir/test_udtf_file.py",
-                "resources/__init__.py",
+                "resources/test_udtf_dir/test_vectorized_udtf.py",
             ],
         )
 
@@ -238,27 +277,47 @@ def test_zip_file_or_directory_to_stream():
             [
                 "resources/",
                 "resources/broken.csv",
+                "resources/diamonds.csv",
+                "resources/iris.csv",
                 "resources/test.avro",
                 "resources/test.orc",
                 "resources/test.parquet",
                 "resources/test.xml",
                 "resources/test2CSV.csv",
                 "resources/testCSV.csv",
+                "resources/testCSVvariousData.csv",
                 "resources/testCSVcolon.csv",
+                "resources/testCSVheader.csv",
                 "resources/testCSVquotes.csv",
+                "resources/testCSVquotesSpecial.csv",
                 "resources/testCSVspecialFormat.csv",
                 "resources/testJSONspecialFormat.json.gz",
                 "resources/testJson.json",
+                "resources/testJsonNewSchema.json",
+                "resources/testJsonSameSchema.json",
                 "resources/test_all_data_types.parquet",
                 "resources/test_file_with_special_characters.parquet",
                 "resources/test_requirements.txt",
+                "resources/test_requirements_unsupported.txt",
+                "resources/test_concat_file1.csv",
+                "resources/test_concat_file2.csv",
+                "resources/test_environment.yml",
+                "resources/test_excel.xlsx",
+                "resources/test_sas.sas7bdat",
+                "resources/test_sas.xpt",
                 "resources/test_sp_dir/",
                 "resources/test_sp_dir/test_sp_file.py",
+                "resources/test_sp_dir/test_sp_mod3_file.py",
+                "resources/test_sp_dir/test_table_sp_file.py",
                 "resources/test_udf_dir/",
+                "resources/test_udf_dir/test_another_udf_file.py",
                 "resources/test_udf_dir/test_pandas_udf_file.py",
                 "resources/test_udf_dir/test_udf_file.py",
                 "resources/test_udtf_dir/",
                 "resources/test_udtf_dir/test_udtf_file.py",
+                "resources/test_udtf_dir/test_vectorized_udtf.py",
+                "resources/test_udaf_dir/",
+                "resources/test_udaf_dir/test_udaf_file.py",
             ],
         )
 
@@ -392,43 +451,36 @@ def test_warning(caplog):
     def f():
         return 1
 
-    try:
-        with caplog.at_level(logging.WARNING):
-            warning("aaa", "bbb", 2)
-            warning("aaa", "bbb", 2)
-            warning("aaa", "bbb", 2)
-        assert caplog.text.count("bbb") == 2
-        with caplog.at_level(logging.WARNING):
-            warning(f.__qualname__, "ccc", 2)
-            warning(f.__qualname__, "ccc", 2)
-            warning(f.__qualname__, "ccc", 2)
-        assert caplog.text.count("ccc") == 2
-    finally:
-        warning_dict.clear()
+    with caplog.at_level(logging.WARNING):
+        warning("aaa", "bbb", 2)
+        warning("aaa", "bbb", 2)
+        warning("aaa", "bbb", 2)
+    assert caplog.text.count("bbb") == 2
+    with caplog.at_level(logging.WARNING):
+        warning(f.__qualname__, "ccc", 2)
+        warning(f.__qualname__, "ccc", 2)
+        warning(f.__qualname__, "ccc", 2)
+    assert caplog.text.count("ccc") == 2
 
 
 @pytest.mark.parametrize("decorator", [deprecated, experimental])
 def test_func_decorator(caplog, decorator):
-    try:
+    @decorator(
+        version="1.0.0",
+        extra_warning_text="extra_warning_text",
+        extra_doc_string="extra_doc_string",
+    )
+    def f():
+        return 1
 
-        @decorator(
-            version="1.0.0",
-            extra_warning_text="extra_warning_text",
-            extra_doc_string="extra_doc_string",
-        )
-        def f():
-            return 1
+    assert "extra_doc_string" in f.__doc__
+    with caplog.at_level(logging.WARNING):
+        f()
+        f()
 
-        assert "extra_doc_string" in f.__doc__
-        with caplog.at_level(logging.WARNING):
-            f()
-            f()
-
-        assert decorator.__name__ in caplog.text
-        assert caplog.text.count("1.0.0") == 1
-        assert caplog.text.count("extra_warning_text") == 1
-    finally:
-        warning_dict.clear()
+    assert decorator.__name__ in caplog.text
+    assert caplog.text.count("1.0.0") == 1
+    assert caplog.text.count("extra_warning_text") == 1
 
 
 def test_is_sql_select_statement():
@@ -450,6 +502,12 @@ def test_is_sql_select_statement():
         "SeLeCt 1",
         "WITH t as (select 1) select * from t",
         "WiTh t as (select 1) select * from t",
+        """WITH t AS (
+            SELECT '
+            with anon_sproc as procedure
+            ' as col1
+           ) select col1 from t
+        """,
     ]
     for s in select_sqls:
         assert is_sql_select_statement(s)
@@ -462,6 +520,8 @@ def test_is_sql_select_statement():
         "show tables",
         "lkdfadsk select",
         "ljkfdshdf with",
+        "with anon_sproc0 as procedure ",
+        "  with anon_sproc1 AS  PROCEDURE ",
     ]
     for ns in non_select_sqls:
         assert is_sql_select_statement(ns) is False
@@ -503,18 +563,14 @@ def test_private_preview_decorator(caplog):
         pass
 
     caplog.clear()
-    warning_dict.clear()
-    try:
-        with caplog.at_level(logging.WARNING):
-            foo()
-        assert extra_doc in foo.__doc__
-        assert expected_warning_text in caplog.messages
-        caplog.clear()
-        with caplog.at_level(logging.WARNING):
-            foo()
-        assert expected_warning_text not in caplog.text
-    finally:
-        warning_dict.clear()
+    with caplog.at_level(logging.WARNING):
+        foo()
+    assert extra_doc in foo.__doc__
+    assert expected_warning_text in caplog.messages
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        foo()
+    assert expected_warning_text not in caplog.text
 
 
 @pytest.mark.parametrize("function", [result_set_to_iter, result_set_to_rows])

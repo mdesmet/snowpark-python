@@ -1,0 +1,186 @@
+## TEST CASE
+
+df = session.table(tables.table1)
+
+variadic = df.to_df("one", "two")
+
+non_variadic = df.to_df(["one", "two"])
+
+
+## EXPECTED UNPARSER OUTPUT
+
+df = session.table("table1")
+
+variadic = df.to_df("one", "two")
+
+non_variadic = df.to_df(["one", "two"])
+
+## EXPECTED ENCODED AST
+
+interned_value_table {
+  string_values {
+    key: -1
+  }
+  string_values {
+    key: 2
+    value: "SRC_POSITION_TEST_MODE"
+  }
+}
+body {
+  assign {
+    expr {
+      sp_table {
+        name {
+          name {
+            sp_name_flat {
+              name: "table1"
+            }
+          }
+        }
+        src {
+          end_column: 41
+          end_line: 25
+          file: 2
+          start_column: 13
+          start_line: 25
+        }
+        variant {
+          sp_session_table: true
+        }
+      }
+    }
+    symbol {
+      value: "df"
+    }
+    uid: 1
+    var_id {
+      bitfield1: 1
+    }
+  }
+}
+body {
+  assign {
+    expr {
+      sp_dataframe_to_df {
+        col_names {
+          args {
+            string_val {
+              src {
+                end_column: 41
+                end_line: 27
+                file: 2
+                start_column: 19
+                start_line: 27
+              }
+              v: "one"
+            }
+          }
+          args {
+            string_val {
+              src {
+                end_column: 41
+                end_line: 27
+                file: 2
+                start_column: 19
+                start_line: 27
+              }
+              v: "two"
+            }
+          }
+          variadic: true
+        }
+        df {
+          sp_dataframe_ref {
+            id {
+              bitfield1: 1
+            }
+          }
+        }
+        src {
+          end_column: 41
+          end_line: 27
+          file: 2
+          start_column: 19
+          start_line: 27
+        }
+      }
+    }
+    symbol {
+      value: "variadic"
+    }
+    uid: 2
+    var_id {
+      bitfield1: 2
+    }
+  }
+}
+body {
+  assign {
+    expr {
+      sp_dataframe_to_df {
+        col_names {
+          args {
+            string_val {
+              src {
+                end_column: 47
+                end_line: 29
+                file: 2
+                start_column: 23
+                start_line: 29
+              }
+              v: "one"
+            }
+          }
+          args {
+            string_val {
+              src {
+                end_column: 47
+                end_line: 29
+                file: 2
+                start_column: 23
+                start_line: 29
+              }
+              v: "two"
+            }
+          }
+        }
+        df {
+          sp_dataframe_ref {
+            id {
+              bitfield1: 1
+            }
+          }
+        }
+        src {
+          end_column: 47
+          end_line: 29
+          file: 2
+          start_column: 23
+          start_line: 29
+        }
+      }
+    }
+    symbol {
+      value: "non_variadic"
+    }
+    uid: 3
+    var_id {
+      bitfield1: 3
+    }
+  }
+}
+client_ast_version: 1
+client_language {
+  python_language {
+    version {
+      label: "final"
+      major: 3
+      minor: 9
+      patch: 1
+    }
+  }
+}
+client_version {
+  major: 1
+  minor: 27
+}

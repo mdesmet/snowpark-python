@@ -1,11 +1,13 @@
 #
-# Copyright (c) 2012-2022 Snowflake Computing Inc. All rights reserved.
+# Copyright (c) 2012-2025 Snowflake Computing Inc. All rights reserved.
 #
-from typing import Optional, Set
+
+from typing import AbstractSet, List, Optional, Type
 
 from snowflake.snowpark._internal.analyzer.expression import (
     Expression,
     derive_dependent_columns,
+    derive_dependent_columns_with_duplication,
 )
 
 
@@ -23,7 +25,7 @@ class NullsLast(NullOrdering):
 
 class SortDirection:
     sql: str
-    default_null_ordering: NullOrdering
+    default_null_ordering: Type[NullOrdering]
 
 
 class Ascending(SortDirection):
@@ -44,6 +46,7 @@ class SortOrder(Expression):
         null_ordering: Optional[NullOrdering] = None,
     ) -> None:
         super().__init__(child)
+        self.child: Expression
         self.direction = direction
         self.null_ordering = (
             null_ordering if null_ordering else direction.default_null_ordering
@@ -51,5 +54,8 @@ class SortOrder(Expression):
         self.datatype = child.datatype
         self.nullable = child.nullable
 
-    def dependent_column_names(self) -> Optional[Set[str]]:
+    def dependent_column_names(self) -> Optional[AbstractSet[str]]:
         return derive_dependent_columns(self.child)
+
+    def dependent_column_names_with_duplication(self) -> List[str]:
+        return derive_dependent_columns_with_duplication(self.child)

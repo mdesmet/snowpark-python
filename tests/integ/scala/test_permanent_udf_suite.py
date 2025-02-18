@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 #
-# Copyright (c) 2012-2022 Snowflake Computing Inc. All rights reserved.
+# Copyright (c) 2012-2025 Snowflake Computing Inc. All rights reserved.
 #
+
 import datetime
 import decimal
 import os
@@ -18,7 +19,14 @@ from snowflake.snowpark.exceptions import (
 from snowflake.snowpark.functions import call_udf, col
 from tests.utils import TempObjectType, TestFiles, Utils
 
-pytestmark = pytest.mark.udf
+pytestmark = [
+    pytest.mark.udf,
+    pytest.mark.xfail(
+        "config.getoption('local_testing_mode', default=False)",
+        reason="Local Testing does not support permanent udfs.",
+        run=False,
+    ),
+]
 
 
 @pytest.fixture(scope="module")
@@ -29,9 +37,6 @@ def new_session(session, db_parameters) -> Session:
     new_session.close()
 
 
-@pytest.mark.skip(
-    "Skip the test before SNOW-541414 is fixed and temp functions are not leaked"
-)
 def test_mix_temporary_and_permanent_udf(session, new_session):
     def add_one(x: int) -> int:
         return x + 1
@@ -107,8 +112,12 @@ def test_support_fully_qualified_udf_name(session, new_session):
     def add_one(x: int) -> int:
         return x + 1
 
-    temp_func_name = f"{session.get_fully_qualified_current_schema()}.{Utils.random_name_for_temp_object(TempObjectType.FUNCTION)}"
-    perm_func_name = f"{session.get_fully_qualified_current_schema()}.{Utils.random_name_for_temp_object(TempObjectType.FUNCTION)}"
+    temp_func_name = session.get_fully_qualified_name_if_possible(
+        Utils.random_name_for_temp_object(TempObjectType.FUNCTION)
+    )
+    perm_func_name = session.get_fully_qualified_name_if_possible(
+        Utils.random_name_for_temp_object(TempObjectType.FUNCTION)
+    )
     stage_name = Utils.random_stage_name()
     try:
         Utils.create_stage(session, stage_name, is_temporary=False)

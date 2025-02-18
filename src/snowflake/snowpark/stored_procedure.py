@@ -1,31 +1,57 @@
 #!/usr/bin/env python3
 #
-# Copyright (c) 2012-2022 Snowflake Computing Inc. All rights reserved.
+# Copyright (c) 2012-2025 Snowflake Computing Inc. All rights reserved.
 #
+
 """Stored procedures in Snowpark. Refer to :class:`~snowflake.snowpark.stored_procedure.StoredProcedure` for details and sample code."""
 import sys
 import typing
 from types import ModuleType
-from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import snowflake.snowpark
+import snowflake.snowpark._internal.proto.generated.ast_pb2 as proto
 from snowflake.connector import ProgrammingError
+from snowflake.snowpark._internal.analyzer.analyzer_utils import result_scan_statement
+from snowflake.snowpark._internal.ast.utils import (
+    build_sproc,
+    build_sproc_apply,
+    with_src_position,
+)
 from snowflake.snowpark._internal.error_message import SnowparkClientExceptionMessages
+from snowflake.snowpark._internal.open_telemetry import (
+    open_telemetry_udf_context_manager,
+)
 from snowflake.snowpark._internal.telemetry import TelemetryField
 from snowflake.snowpark._internal.type_utils import convert_sp_to_sf_type
 from snowflake.snowpark._internal.udf_utils import (
     UDFColumn,
+    add_snowpark_package_to_sproc_packages,
+    check_execute_as_arg,
+    check_python_runtime_version,
     check_register_args,
     cleanup_failed_permanent_registration,
     create_python_udf_or_sp,
+    generate_anonymous_python_sp_sql,
+    generate_call_python_sp_sql,
     process_file_path,
     process_registration_inputs,
     resolve_imports_and_packages,
 )
-from snowflake.snowpark._internal.utils import TempObjectType
-from snowflake.snowpark.types import DataType
+from snowflake.snowpark._internal.utils import (
+    TempObjectType,
+    check_imports_type,
+    publicapi,
+)
+from snowflake.snowpark.types import DataType, StructType
 
-EXECUTE_AS_WHITELIST = frozenset(["owner", "caller"])
+# Python 3.8 needs to use typing.Iterable because collections.abc.Iterable is not subscriptable
+# Python 3.9 can use both
+# Python 3.10 needs to use collections.abc.Iterable because typing.Iterable is removed
+if sys.version_info <= (3, 9):
+    from typing import Iterable
+else:
+    from collections.abc import Iterable
 
 
 class StoredProcedure:
@@ -50,6 +76,11 @@ class StoredProcedure:
         input_types: List[DataType],
         name: str,
         execute_as: typing.Literal["caller", "owner"] = "owner",
+        anonymous_sp_sql: Optional[str] = None,
+        packages: Optional[List[Union[str, ModuleType]]] = None,
+        _ast: Optional[proto.StoredProcedure] = None,
+        _ast_id: Optional[int] = None,
+        _ast_stmt: Optional[proto.Assign] = None,
     ) -> None:
         #: The Python function.
         self.func: Callable = func
@@ -59,12 +90,21 @@ class StoredProcedure:
         self._return_type = return_type
         self._input_types = input_types
         self._execute_as = execute_as
+        self._anonymous_sp_sql = anonymous_sp_sql
+        self._is_return_table = isinstance(return_type, StructType)
+        self._packages = packages
 
-    def __call__(
+        # If None, no ast will be emitted. Else, passed whenever sproc is invoked.
+        self._ast = _ast
+        self._ast_id = _ast_id
+        # field to hold the assign statement for the stored procedure
+        self._ast_stmt = _ast_stmt
+
+    def _validate_call(
         self,
-        *args: Any,
+        args: List[Any],
         session: Optional["snowflake.snowpark.session.Session"] = None,
-    ) -> any:
+    ):
         if args and isinstance(args[0], snowflake.snowpark.session.Session):
             if session:
                 raise ValueError(
@@ -76,15 +116,69 @@ class StoredProcedure:
         else:
             session = session or snowflake.snowpark.session._get_active_session()
 
-        if len(self._input_types) != len(args):
+        if len(self._input_types) < len(args):
             raise ValueError(
-                f"Incorrect number of arguments passed to the stored procedure. Expected: {len(self._input_types)}, Found: {len(args)}"
+                f"Incorrect number of arguments passed to the stored procedure. "
+                f"Expected: <={len(self._input_types)}, Found: {len(args)}"
             )
+
+        return args, session
+
+    @publicapi
+    def __call__(
+        self,
+        *args: Any,
+        session: Optional["snowflake.snowpark.session.Session"] = None,
+        statement_params: Optional[Dict[str, str]] = None,
+        _emit_ast: bool = True,
+    ) -> Any:
+        args, session = self._validate_call(args, session)
 
         session._conn._telemetry_client.send_function_usage_telemetry(
             "StoredProcedure.__call__", TelemetryField.FUNC_CAT_USAGE.value
         )
-        return session.call(self.name, *args)
+
+        sproc_expr = None
+        if _emit_ast and self._ast is not None:
+            assert (
+                self._ast is not None
+            ), "Need to ensure _emit_ast is True when registering a stored procedure."
+            assert (
+                self._ast_id is not None
+            ), "Need to assign an ID to the stored procedure."
+            sproc_expr = proto.Expr()
+            build_sproc_apply(sproc_expr, self._ast_id, statement_params, *args)
+
+        if self._anonymous_sp_sql:
+            call_sql = generate_call_python_sp_sql(session, self.name, *args)
+            query = f"{self._anonymous_sp_sql}{call_sql}"
+            if self._is_return_table:
+                qid = session._conn.execute_and_get_sfqid(
+                    query, statement_params=statement_params
+                )
+                df = session.sql(result_scan_statement(qid))
+                df._ast = sproc_expr
+                return df
+            df = session.sql(query)
+            res = df._internal_collect_with_tag(statement_params=statement_params)[0][0]
+        else:
+            res = session._call(
+                self.name,
+                *args,
+                is_return_table=self._is_return_table,
+                statement_params=statement_params,
+                _emit_ast=self._is_return_table,
+            )
+
+        if self._is_return_table:
+            # If the result is a Column or DataFrame object, the expression `eval` is performed in a later operation
+            # such as `collect` or `show`.
+            res._ast = sproc_expr
+        elif self._ast_stmt is not None:
+            # If the result is a scalar, we can return it immediately. Perform the `eval` operation here.
+            session._ast_batch.eval(self._ast_stmt)
+
+        return res
 
 
 class StoredProcedureRegistration:
@@ -163,6 +257,10 @@ class StoredProcedureRegistration:
         3. Currently calling stored procedure that requires VARIANT and GEOGRAPHY input types is not supported
         in snowpark API.
 
+        4. Dataframe returned from :meth:`~snowflake.snowpark.Session.call` does not support stacking dataframe
+        operations when sql simplifier is disabled, and output columns in return type for the table stored
+        procedure are not defined.
+
     Example 1
         Use stored procedure to copy data from one table to another::
 
@@ -184,7 +282,7 @@ class StoredProcedureRegistration:
             [Row(MY_COPY_SP='SUCCESS')]
             >>> session.table("test_to").count()
             10
-            >>> # call using session#call API
+            >>> # call using session.call API
             >>> _ = session.sql("drop table if exists test_to").collect()
             >>> session.call("my_copy_sp", "test_from", "test_to", 10)
             'SUCCESS'
@@ -231,12 +329,36 @@ class StoredProcedureRegistration:
             ...     return_type=IntegerType(),
             ...     input_types=[IntegerType(), IntegerType()],
             ...     is_permanent=True,
-            ...     name="mul",
+            ...     name="mul_sp",
             ...     replace=True,
             ...     stage_location="@mystage",
             ... )
-            >>> session.sql("call mul(5, 6)").collect()
-            [Row(MUL=30)]
+            >>> session.sql("call mul_sp(5, 6)").collect()
+            [Row(MUL_SP=30)]
+            >>> # skip stored proc creation if it already exists
+            >>> _ = session.sproc.register(
+            ...     lambda session_, x, y: session_.sql(f"SELECT {x} * {y} + 1").collect()[0][0],
+            ...     return_type=IntegerType(),
+            ...     input_types=[IntegerType(), IntegerType()],
+            ...     is_permanent=True,
+            ...     name="mul_sp",
+            ...     if_not_exists=True,
+            ...     stage_location="@mystage",
+            ... )
+            >>> session.sql("call mul_sp(5, 6)").collect()
+            [Row(MUL_SP=30)]
+            >>> # overwrite stored procedure
+            >>> _ = session.sproc.register(
+            ...     lambda session_, x, y: session_.sql(f"SELECT {x} * {y} + 1").collect()[0][0],
+            ...     return_type=IntegerType(),
+            ...     input_types=[IntegerType(), IntegerType()],
+            ...     is_permanent=True,
+            ...     name="mul_sp",
+            ...     replace=True,
+            ...     stage_location="@mystage",
+            ... )
+            >>> session.sql("call mul_sp(5, 6)").collect()
+            [Row(MUL_SP=31)]
 
     Example 5
         Create a stored procedure with stored-procedure-level imports and call it::
@@ -295,6 +417,54 @@ class StoredProcedureRegistration:
             >>> mod5_sp(2)
             2
 
+    Example 9
+        Creating a table stored procedure with return type while defining return columns and datatypes::
+
+            >>> from snowflake.snowpark.types import IntegerType, StructField, StructType
+            >>> @sproc(return_type=StructType([StructField("A", IntegerType()), StructField("B", IntegerType())]), input_types=[IntegerType(), IntegerType()])
+            ... def select_sp(session_, x, y):
+            ...     return session_.sql(f"SELECT {x} as A, {y} as B")
+            ...
+            >>> select_sp(1, 2).show()
+            -------------
+            |"A"  |"B"  |
+            -------------
+            |1    |2    |
+            -------------
+            <BLANKLINE>
+
+    Example 10
+        Creating a table stored procedure with return type with free return columns::
+
+            >>> from snowflake.snowpark.types import IntegerType, StructType
+            >>> @sproc(return_type=StructType(), input_types=[IntegerType(), IntegerType()])
+            ... def select_sp(session_, x, y):
+            ...     return session_.sql(f"SELECT {x} as A, {y} as B")
+            ...
+            >>> select_sp(1, 2).show()
+            -------------
+            |"A"  |"B"  |
+            -------------
+            |1    |2    |
+            -------------
+            <BLANKLINE>
+
+    Example 11
+        Creating a table stored procedure using implicit type hints::
+
+            >>> from snowflake.snowpark.dataframe import DataFrame
+            >>> @sproc
+            ... def select_sp(session_: snowflake.snowpark.Session, x: int, y: int) -> DataFrame:
+            ...     return session_.sql(f"SELECT {x} as A, {y} as B")
+            ...
+            >>> select_sp(1, 2).show()
+            -------------
+            |"A"  |"B"  |
+            -------------
+            |1    |2    |
+            -------------
+            <BLANKLINE>
+
     See Also:
         - :class:`snowflake.snowpark.udf.UDFRegistration`
         - :func:`~snowflake.snowpark.functions.sproc`
@@ -304,7 +474,7 @@ class StoredProcedureRegistration:
         - :meth:`~snowflake.snowpark.Session.add_packages`
     """
 
-    def __init__(self, session: "snowflake.snowpark.session.Session") -> None:
+    def __init__(self, session: Optional["snowflake.snowpark.session.Session"]) -> None:
         self._session = session
 
     def describe(
@@ -322,6 +492,7 @@ class StoredProcedureRegistration:
             f"describe procedure {sproc_obj.name}({','.join(func_args)})"
         )
 
+    @publicapi
     def register(
         self,
         func: Union[Callable, Tuple[str, str]],
@@ -333,12 +504,19 @@ class StoredProcedureRegistration:
         imports: Optional[List[Union[str, Tuple[str, str]]]] = None,
         packages: Optional[List[Union[str, ModuleType]]] = None,
         replace: bool = False,
+        if_not_exists: bool = False,
         parallel: int = 4,
         execute_as: typing.Literal["caller", "owner"] = "owner",
         strict: bool = False,
+        external_access_integrations: Optional[List[str]] = None,
+        secrets: Optional[Dict[str, str]] = None,
+        comment: Optional[str] = None,
+        copy_grants: bool = False,
         *,
         statement_params: Optional[Dict[str, str]] = None,
         source_code_display: bool = True,
+        _emit_ast: bool = True,
+        **kwargs,
     ) -> StoredProcedure:
         """
         Registers a Python function as a Snowflake Python stored procedure and returns the stored procedure.
@@ -383,6 +561,9 @@ class StoredProcedureRegistration:
                 If it is ``False``, attempting to register a stored procedure with a name that already exists
                 results in a ``SnowparkSQLException`` exception being thrown. If it is ``True``,
                 an existing stored procedure with the same name is overwritten.
+            if_not_exists: Whether to skip creation of a stored procedure the same procedure is already registered.
+                The default is ``False``. ``if_not_exists`` and ``replace`` are mutually exclusive and a ``ValueError``
+                is raised when both are set. If it is ``True`` and a stored procedure is already registered, the registration is skipped.
             parallel: The number of threads to use for uploading stored procedure files with the
                 `PUT <https://docs.snowflake.com/en/sql-reference/sql/put.html#put>`_
                 command. The default value is 4 and supported values are from 1 to 99.
@@ -398,47 +579,67 @@ class StoredProcedureRegistration:
                 The source code is dynamically generated therefore it may not be identical to how the
                 `func` is originally defined. The default is ``True``.
                 If it is ``False``, source code will not be generated or displayed.
+            external_access_integrations: The names of one or more external access integrations. Each
+                integration you specify allows access to the external network locations and secrets
+                the integration specifies.
+            secrets: The key-value pairs of string types of secrets used to authenticate the external network location.
+                The secrets can be accessed from handler code. The secrets specified as values must
+                also be specified in the external access integration and the keys are strings used to
+                retrieve the secrets using secret API.
+            comment: Adds a comment for the created object. See
+                `COMMENT <https://docs.snowflake.com/en/sql-reference/sql/comment>`_
+            copy_grants: Specifies to retain the access privileges from the original function when a new function is
+                created using CREATE OR REPLACE PROCEDURE.
 
         See Also:
             - :func:`~snowflake.snowpark.functions.sproc`
             - :meth:`register_from_file`
         """
-        if not callable(func):
-            raise TypeError(
-                "Invalid function: not a function or callable "
-                f"(__call__ is not defined): {type(func)}"
-            )
-        if (
-            not isinstance(execute_as, str)
-            or execute_as.lower() not in EXECUTE_AS_WHITELIST
-        ):
-            raise TypeError(
-                f"'execute_as' value '{execute_as}' is invalid, choose from "
-                f"{', '.join(EXECUTE_AS_WHITELIST, )}"
+        with open_telemetry_udf_context_manager(self.register, func=func, name=name):
+            if not callable(func) and kwargs.get("_registered_object_name") is None:
+                raise TypeError(
+                    "Invalid function: not a function or callable "
+                    f"(__call__ is not defined): {type(func)}"
+                )
+
+            check_execute_as_arg(execute_as)
+            check_register_args(
+                TempObjectType.PROCEDURE, name, is_permanent, stage_location, parallel
             )
 
-        check_register_args(
-            TempObjectType.PROCEDURE, name, is_permanent, stage_location, parallel
-        )
+            # register stored procedure
+            return self._do_register_sp(
+                func,
+                return_type,
+                input_types,
+                name,
+                stage_location,
+                imports,
+                packages,
+                replace,
+                if_not_exists,
+                parallel,
+                strict,
+                external_access_integrations=external_access_integrations,
+                secrets=secrets,
+                comment=comment,
+                copy_grants=copy_grants,
+                statement_params=statement_params,
+                execute_as=execute_as,
+                api_call_source="StoredProcedureRegistration.register",
+                source_code_display=source_code_display,
+                anonymous=kwargs.pop("anonymous", False),
+                is_permanent=is_permanent,
+                # force_inline_code avoids uploading python file
+                # when we know the code is not too large. This is useful
+                # in pandas API to create stored procedures not registered by users.
+                force_inline_code=kwargs.pop("force_inline_code", False),
+                native_app_params=kwargs.pop("native_app_params", None),
+                _emit_ast=_emit_ast,
+                **kwargs,
+            )
 
-        # register stored procedure
-        return self._do_register_sp(
-            func,
-            return_type,
-            input_types,
-            name,
-            stage_location,
-            imports,
-            packages,
-            replace,
-            parallel,
-            strict,
-            statement_params=statement_params,
-            execute_as=execute_as,
-            api_call_source="StoredProcedureRegistration.register",
-            source_code_display=source_code_display,
-        )
-
+    @publicapi
     def register_from_file(
         self,
         file_path: str,
@@ -451,11 +652,19 @@ class StoredProcedureRegistration:
         imports: Optional[List[Union[str, Tuple[str, str]]]] = None,
         packages: Optional[List[Union[str, ModuleType]]] = None,
         replace: bool = False,
+        if_not_exists: bool = False,
         parallel: int = 4,
+        execute_as: typing.Literal["caller", "owner"] = "owner",
         strict: bool = False,
+        external_access_integrations: Optional[List[str]] = None,
+        secrets: Optional[Dict[str, str]] = None,
+        comment: Optional[str] = None,
+        copy_grants: bool = False,
         *,
         statement_params: Optional[Dict[str, str]] = None,
         source_code_display: bool = True,
+        skip_upload_on_content_match: bool = False,
+        _emit_ast: bool = True,
     ) -> StoredProcedure:
         """
         Registers a Python function as a Snowflake Python stored procedure from a Python or zip file,
@@ -506,11 +715,16 @@ class StoredProcedureRegistration:
                 If it is ``False``, attempting to register a stored procedure with a name that already exists
                 results in a ``SnowparkSQLException`` exception being thrown. If it is ``True``,
                 an existing stored procedure with the same name is overwritten.
+            if_not_exists: Whether to skip creation of a stored procedure the same procedure is already registered.
+                The default is ``False``. ``if_not_exists`` and ``replace`` are mutually exclusive and a ``ValueError``
+                is raised when both are set. If it is ``True`` and a stored procedure is already registered, the registration is skipped.
             parallel: The number of threads to use for uploading stored procedure files with the
                 `PUT <https://docs.snowflake.com/en/sql-reference/sql/put.html#put>`_
                 command. The default value is 4 and supported values are from 1 to 99.
                 Increasing the number of threads can improve performance when uploading
                 large stored procedure files.
+            execute_as: What permissions should the procedure have while executing. This
+                supports caller, or owner for now.
             strict: Whether the created stored procedure is strict. A strict stored procedure will not invoke
                 the stored procedure if any input is null. Instead, a null value will always be returned. Note
                 that the stored procedure might still return null for non-null inputs.
@@ -519,6 +733,20 @@ class StoredProcedureRegistration:
                 The source code is dynamically generated therefore it may not be identical to how the
                 `func` is originally defined. The default is ``True``.
                 If it is ``False``, source code will not be generated or displayed.
+            skip_upload_on_content_match: When set to ``True`` and a version of source file already exists on stage, the given source
+                file will be uploaded to stage only if the contents of the current file differ from the remote file on stage. Defaults
+                to ``False``.
+            external_access_integrations: The names of one or more external access integrations. Each
+                integration you specify allows access to the external network locations and secrets
+                the integration specifies.
+            secrets: The key-value pairs of string types of secrets used to authenticate the external network location.
+                The secrets can be accessed from handler code. The secrets specified as values must
+                also be specified in the external access integration and the keys are strings used to
+                retrieve the secrets using secret API.
+            comment: Adds a comment for the created object. See
+                `COMMENT <https://docs.snowflake.com/en/sql-reference/sql/comment>`_
+            copy_grants: Specifies to retain the access privileges from the original function when a new function is
+                created using CREATE OR REPLACE PROCEDURE.
 
         Note::
             The type hints can still be extracted from the source Python file if they
@@ -530,27 +758,40 @@ class StoredProcedureRegistration:
             - :func:`~snowflake.snowpark.functions.sproc`
             - :meth:`register`
         """
-        file_path = process_file_path(file_path)
-        check_register_args(
-            TempObjectType.PROCEDURE, name, is_permanent, stage_location, parallel
-        )
+        with open_telemetry_udf_context_manager(
+            self.register_from_file, file_path=file_path, func_name=func_name, name=name
+        ):
+            file_path = process_file_path(file_path)
+            check_register_args(
+                TempObjectType.PROCEDURE, name, is_permanent, stage_location, parallel
+            )
+            check_execute_as_arg(execute_as)
 
-        # register stored procedure
-        return self._do_register_sp(
-            (file_path, func_name),
-            return_type,
-            input_types,
-            name,
-            stage_location,
-            imports,
-            packages,
-            replace,
-            parallel,
-            strict,
-            statement_params=statement_params,
-            api_call_source="StoredProcedureRegistration.register_from_file",
-            source_code_display=source_code_display,
-        )
+            # register stored procedure
+            return self._do_register_sp(
+                (file_path, func_name),
+                return_type,
+                input_types,
+                name,
+                stage_location,
+                imports,
+                packages,
+                replace,
+                if_not_exists,
+                parallel,
+                strict,
+                external_access_integrations=external_access_integrations,
+                secrets=secrets,
+                comment=comment,
+                copy_grants=copy_grants,
+                statement_params=statement_params,
+                execute_as=execute_as,
+                api_call_source="StoredProcedureRegistration.register_from_file",
+                source_code_display=source_code_display,
+                skip_upload_on_content_match=skip_upload_on_content_match,
+                is_permanent=is_permanent,
+                _emit_ast=_emit_ast,
+            )
 
     def _do_register_sp(
         self,
@@ -562,20 +803,54 @@ class StoredProcedureRegistration:
         imports: Optional[List[Union[str, Tuple[str, str]]]],
         packages: Optional[List[Union[str, ModuleType]]],
         replace: bool,
+        if_not_exists: bool,
         parallel: int,
         strict: bool,
         *,
         source_code_display: bool = False,
         statement_params: Optional[Dict[str, str]] = None,
         execute_as: typing.Literal["caller", "owner"] = "owner",
+        anonymous: bool = False,
         api_call_source: str,
+        skip_upload_on_content_match: bool = False,
+        is_permanent: bool = False,
+        external_access_integrations: Optional[List[str]] = None,
+        secrets: Optional[Dict[str, str]] = None,
+        force_inline_code: bool = False,
+        comment: Optional[str] = None,
+        native_app_params: Optional[Dict[str, Any]] = None,
+        copy_grants: bool = False,
+        _emit_ast: bool = True,
+        **kwargs,
     ) -> StoredProcedure:
+        stmt, ast, ast_id = None, None, None
+        if kwargs.get("_registered_object_name") is not None:
+            if _emit_ast:
+                stmt = self._session._ast_batch.assign()
+                ast = with_src_position(stmt.expr.stored_procedure, stmt)
+                ast_id = stmt.var_id.bitfield1
+
+            return StoredProcedure(
+                func,
+                return_type,
+                input_types,
+                kwargs["_registered_object_name"],
+                execute_as=execute_as,
+                packages=packages,
+                _ast=ast,
+                _ast_id=ast_id,
+                _ast_stmt=stmt,
+            )
+
+        check_imports_type(imports, "stored-proc-level")
+
         (
-            udf_name,
+            sproc_name,
             is_pandas_udf,
             is_dataframe_input,
             return_type,
             input_types,
+            opt_arg_defaults,
         ) = process_registration_inputs(
             self._session,
             TempObjectType.PROCEDURE,
@@ -583,15 +858,53 @@ class StoredProcedureRegistration:
             return_type,
             input_types,
             sp_name,
+            anonymous,
         )
 
+        # Capture original parameters.
+        if _emit_ast:
+            stmt = self._session._ast_batch.assign()
+            ast = with_src_position(stmt.expr.stored_procedure, stmt)
+            ast_id = stmt.var_id.bitfield1
+
+            build_sproc(
+                ast,
+                func,
+                return_type=return_type,
+                input_types=input_types,
+                sp_name=sp_name,
+                stage_location=stage_location,
+                imports=imports,
+                packages=packages,
+                replace=replace,
+                if_not_exists=if_not_exists,
+                parallel=parallel,
+                statement_params=statement_params,
+                execute_as=execute_as,
+                strict=strict,
+                source_code_display=source_code_display,
+                external_access_integrations=external_access_integrations,
+                secrets=secrets,
+                comment=comment,
+                is_permanent=is_permanent,
+                session=self._session,
+                _registered_object_name=sproc_name,
+                **kwargs,
+            )
+
         if is_pandas_udf:
-            raise TypeError("Pandas stored procedure is not supported")
+            raise TypeError("pandas stored procedure is not supported")
 
         arg_names = ["session"] + [f"arg{i+1}" for i in range(len(input_types))]
         input_args = [
             UDFColumn(dt, arg_name) for dt, arg_name in zip(input_types, arg_names[1:])
         ]
+
+        # Add in snowflake-snowpark-python if it is not already in the package list.
+        packages = add_snowpark_package_to_sproc_packages(
+            session=self._session,
+            packages=packages,
+        )
 
         (
             handler,
@@ -599,62 +912,112 @@ class StoredProcedureRegistration:
             all_imports,
             all_packages,
             upload_file_stage_location,
+            custom_python_runtime_version_allowed,
         ) = resolve_imports_and_packages(
             self._session,
             TempObjectType.PROCEDURE,
             func,
             arg_names,
-            udf_name,
+            sproc_name,
             stage_location,
             imports,
             packages,
             parallel,
             statement_params=statement_params,
             source_code_display=source_code_display,
+            skip_upload_on_content_match=skip_upload_on_content_match,
+            is_permanent=is_permanent,
+            force_inline_code=force_inline_code,
         )
 
-        raised = False
-        try:
-            create_python_udf_or_sp(
-                session=self._session,
+        runtime_version_from_requirement = None
+        if self._session is not None:
+            runtime_version_from_requirement = (
+                self._session._runtime_version_from_requirement
+            )
+
+        if not custom_python_runtime_version_allowed:
+            check_python_runtime_version(runtime_version_from_requirement)
+
+        anonymous_sp_sql = None
+        if anonymous:
+            anonymous_sp_sql = generate_anonymous_python_sp_sql(
+                func=func,
                 return_type=return_type,
                 input_args=input_args,
                 handler=handler,
-                object_type=TempObjectType.PROCEDURE,
-                object_name=udf_name,
+                object_name=sproc_name,
                 all_imports=all_imports,
                 all_packages=all_packages,
-                is_temporary=stage_location is None,
-                replace=replace,
+                raw_imports=imports,
                 inline_python_code=code,
-                execute_as=execute_as,
-                api_call_source=api_call_source,
                 strict=strict,
+                runtime_version=runtime_version_from_requirement,
+                external_access_integrations=external_access_integrations,
+                secrets=secrets,
+                native_app_params=native_app_params,
             )
-        # an exception might happen during registering a stored procedure
-        # (e.g., a dependency might not be found on the stage),
-        # then for a permanent stored procedure, we should delete the uploaded
-        # python file and raise the exception
-        except ProgrammingError as pe:
-            raised = True
-            tb = sys.exc_info()[2]
-            ne = SnowparkClientExceptionMessages.SQL_EXCEPTION_FROM_PROGRAMMING_ERROR(
-                pe
-            )
-            raise ne.with_traceback(tb) from None
-        except BaseException:
-            raised = True
-            raise
-        finally:
-            if raised:
-                cleanup_failed_permanent_registration(
-                    self._session, upload_file_stage_location, stage_location
+        else:
+            raised = False
+            try:
+                create_python_udf_or_sp(
+                    session=self._session,
+                    func=func,
+                    return_type=return_type,
+                    input_args=input_args,
+                    opt_arg_defaults=opt_arg_defaults,
+                    handler=handler,
+                    object_type=TempObjectType.PROCEDURE,
+                    object_name=sproc_name,
+                    all_imports=all_imports,
+                    all_packages=all_packages,
+                    raw_imports=imports,
+                    is_permanent=is_permanent,
+                    replace=replace,
+                    if_not_exists=if_not_exists,
+                    inline_python_code=code,
+                    execute_as=execute_as,
+                    api_call_source=api_call_source,
+                    strict=strict,
+                    external_access_integrations=external_access_integrations,
+                    secrets=secrets,
+                    statement_params=statement_params,
+                    comment=comment,
+                    native_app_params=native_app_params,
+                    copy_grants=copy_grants,
+                    runtime_version=runtime_version_from_requirement,
                 )
+            # an exception might happen during registering a stored procedure
+            # (e.g., a dependency might not be found on the stage),
+            # then for a permanent stored procedure, we should delete the uploaded
+            # python file and raise the exception
+            except ProgrammingError as pe:
+                raised = True
+                tb = sys.exc_info()[2]
+                ne = SnowparkClientExceptionMessages.SQL_EXCEPTION_FROM_PROGRAMMING_ERROR(
+                    pe
+                )
+                raise ne.with_traceback(tb) from None
+            except BaseException:
+                raised = True
+                raise
+            finally:
+                if raised:
+                    cleanup_failed_permanent_registration(
+                        self._session, upload_file_stage_location, stage_location
+                    )
 
-        return StoredProcedure(
+        sproc = StoredProcedure(
             func,
             return_type,
             input_types,
-            udf_name,
+            sproc_name,
             execute_as=execute_as,
+            anonymous_sp_sql=anonymous_sp_sql,
+            packages=packages,
+            _ast=ast,
+            _ast_id=ast_id,
+            _ast_stmt=stmt,
         )
+
+        return sproc

@@ -1,9 +1,11 @@
 #
-# Copyright (c) 2012-2022 Snowflake Computing Inc. All rights reserved.
+# Copyright (c) 2012-2025 Snowflake Computing Inc. All rights reserved.
 #
+
 import io
 import logging
 from unittest import mock
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -86,12 +88,13 @@ def test_run_query_exceptions(mock_server_connection, caplog):
     ):
         with pytest.raises(Exception, match="fake exception"):
             with caplog.at_level(logging.ERROR):
-                mock_server_connection.run_query("fake query")
+                mock_server_connection.run_query("fake query", log_on_exception=True)
         assert "Failed to execute query" in caplog.text
 
     mock_server_connection._cursor.execute.return_value = mock_server_connection._cursor
     mock_server_connection._cursor.sfqid = "fake id"
     mock_server_connection._cursor.query = "fake query"
+    mock_server_connection._cursor._request_id = "1234"
     with mock.patch.object(
         mock_server_connection._cursor,
         "fetch_pandas_all",
@@ -106,21 +109,24 @@ def test_run_query_exceptions(mock_server_connection, caplog):
         side_effect=BaseException("fake exception"),
     ):
         with pytest.raises(
-            SnowparkFetchDataException, match="Failed to fetch a Pandas Dataframe"
+            SnowparkFetchDataException, match="Failed to fetch a pandas Dataframe"
         ):
             mock_server_connection.run_query("fake query", to_pandas=True)
 
 
 def test_get_result_set_exception(mock_server_connection):
-    fake_plan = SnowflakePlan(
-        queries=[Query("fake query 1"), Query("fake query 2")],
-        schema_query="fake schema query",
-    )
     fake_session = mock.create_autospec(Session)
+    fake_session._collect_snowflake_plan_telemetry_at_critical_path = True
     fake_session._generate_new_action_id.return_value = 1
     fake_session._last_canceled_id = 100
     fake_session._conn = mock_server_connection
-    fake_plan.session = fake_session
+    fake_session._cte_optimization_enabled = False
+    fake_session._query_compilation_stage_enabled = False
+    fake_plan = SnowflakePlan(
+        queries=[Query("fake query 1"), Query("fake query 2")],
+        schema_query="fake schema query",
+        session=fake_session,
+    )
     with pytest.raises(
         SnowparkQueryCancelledException,
         match="The query has been cancelled by the user",
@@ -137,3 +143,28 @@ def test_get_result_set_exception(mock_server_connection):
     with mock.patch.object(mock_server_connection, "run_query", return_value=None):
         with pytest.raises(SnowparkSQLException, match="doesn't return a ResultSet"):
             mock_server_connection.get_result_set(fake_plan, block=False)
+
+
+def test_run_query_when_ignore_results_true(mock_server_connection):
+    mock_cursor1 = MagicMock()
+    mock_cursor1.sfqid = "ignore_results is True"
+
+    mock_server_connection.execute_and_notify_query_listener = MagicMock()
+    mock_server_connection.execute_and_notify_query_listener.return_value = mock_cursor1
+
+    mock_server_connection._to_data_or_iter = MagicMock()
+    mock_server_connection._to_data_or_iter.return_value = {
+        "sfqid": "ignore_results is False"
+    }
+
+    result = mock_server_connection.run_query(
+        "select * from fake_table", ignore_results=True
+    )
+    mock_server_connection._to_data_or_iter.assert_not_called()
+    assert "sfqid" in result and result["sfqid"] == "ignore_results is True"
+
+    result = mock_server_connection.run_query(
+        "select * from fake_table", ignore_results=False
+    )
+    mock_server_connection._to_data_or_iter.assert_called()
+    assert "sfqid" in result and result["sfqid"] == "ignore_results is False"

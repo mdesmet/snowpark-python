@@ -1,11 +1,16 @@
 #
-# Copyright (c) 2012-2022 Snowflake Computing Inc. All rights reserved.
+# Copyright (c) 2012-2025 Snowflake Computing Inc. All rights reserved.
 #
-from typing import Optional, Set
+
+from typing import AbstractSet, List, Optional
 
 from snowflake.snowpark._internal.analyzer.expression import (
     Expression,
     derive_dependent_columns,
+    derive_dependent_columns_with_duplication,
+)
+from snowflake.snowpark._internal.analyzer.query_plan_analysis_utils import (
+    PlanNodeCategory,
 )
 
 
@@ -22,8 +27,15 @@ class BinaryExpression(Expression):
     def __str__(self):
         return f"{self.left} {self.sql_operator} {self.right}"
 
-    def dependent_column_names(self) -> Optional[Set[str]]:
+    def dependent_column_names(self) -> Optional[AbstractSet[str]]:
         return derive_dependent_columns(self.left, self.right)
+
+    def dependent_column_names_with_duplication(self) -> List[str]:
+        return derive_dependent_columns_with_duplication(self.left, self.right)
+
+    @property
+    def plan_node_category(self) -> PlanNodeCategory:
+        return PlanNodeCategory.LOW_IMPACT
 
 
 class BinaryArithmeticExpression(BinaryExpression):

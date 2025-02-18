@@ -1,5 +1,6 @@
 {% set name = "snowflake-snowpark-python" %}
-{% set version = "1.1.0" %}
+{% set version = "1.27.0" %}
+{% set noarch_build = (os.environ.get('SNOWFLAKE_SNOWPARK_PYTHON_NOARCH_BUILD', 'false')) == 'true' %}
 
 package:
   name: {{ name|lower }}
@@ -11,8 +12,17 @@ source:
 
 build:
   number: {{ os.environ.get('SNOWFLAKE_SNOWPARK_PYTHON_BUILD_NUMBER', 0) }}
-  skip: True  # [py<38 or py>=39 or win32 or s390x]
+  skip: True  # [py<38 or win32 or s390x]
   script: {{ PYTHON }} -m pip install . --no-deps -vvv
+  script_env:
+    - SNOWFLAKE_IS_PYTHON_RUNTIME_TEST=1
+{% if noarch_build %}
+  noarch: python
+  string: "py39_0"  # [py==39]
+  string: "py310_0"  # [py==310]
+  string: "py311_0"  # [py==311]
+  string: "py312_0"  # [py==312]
+{% endif %}
 
 requirements:
   host:
@@ -20,13 +30,26 @@ requirements:
     - pip
     - setuptools >=40.6.0
     - wheel
+    # Snowpark IR
+    - protobuf==3.20.1  # [py<=310]
+    - protobuf==4.25.3  # [py>310]
+    - mypy-protobuf
   run:
     - python
-    - cloudpickle >=1.6.0,<=2.0.0
-    - snowflake-connector-python
-    - typing-extensions >=4.1.0
-    # need to pin libffi to <3.4.2 because of problems in cryptography
-    - libffi <3.4.2
+    - cloudpickle >=1.6.0,<=2.2.1,!=2.1.0,!=2.2.0
+    - snowflake-connector-python >=3.12.0,<4.0.0
+    - typing-extensions >=4.1.0,<5.0.0
+    # need to pin libffi because of problems in cryptography.
+    # This might no longer hold true but keep it just to avoid it from biting us again
+    - libffi <=3.4.4
+    - pyyaml
+    # Snowpark IR
+    - protobuf >=3.20,<6
+    - python-dateutil
+    - tzlocal
+  run_constrained:
+    # Snowpark pandas
+    - modin==0.30.1
 
 test:
   imports:

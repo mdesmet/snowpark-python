@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 #
-# Copyright (c) 2012-2022 Snowflake Computing Inc. All rights reserved.
+# Copyright (c) 2012-2025 Snowflake Computing Inc. All rights reserved.
 #
+import datetime
 import math
+from decimal import Decimal
 
 import pytest
 
@@ -15,8 +17,24 @@ from snowflake.snowpark.exceptions import (
     SnowparkSQLUnexpectedAliasException,
 )
 from snowflake.snowpark.functions import avg, col, in_, lit, parse_json, sql_expr, when
-from snowflake.snowpark.types import StringType
-from tests.utils import TestData, Utils
+from snowflake.snowpark.types import (
+    BinaryType,
+    BooleanType,
+    DateType,
+    DecimalType,
+    DoubleType,
+    FloatType,
+    IntegerType,
+    LongType,
+    ShortType,
+    StringType,
+    StructField,
+    StructType,
+    TimestampTimeZone,
+    TimestampType,
+    TimeType,
+)
+from tests.utils import IS_IN_STORED_PROC, TestData, Utils, multithreaded_run
 
 
 def test_column_names_with_space(session):
@@ -32,6 +50,7 @@ def test_column_names_with_space(session):
     assert df.select(df[c2]).collect() == [Row("a")]
 
 
+@multithreaded_run()
 def test_column_alias_and_case_insensitive_name(session):
     df = session.create_dataframe([1, 2]).to_df(["a"])
     assert df.select(df["a"].as_("b")).schema.fields[0].name == "B"
@@ -94,6 +113,22 @@ def test_equal_and_not_equal(session):
     ).collect() == [  # noqa: E712
         Row(2, False, "b")
     ]
+    test_data2 = session.create_dataframe(
+        [[0.1, 0.1], [0.2, 0.6], [0.3, 0.7]],
+        schema=StructType(
+            [
+                StructField("A", DecimalType(20, 2), nullable=True),
+                StructField("B", DecimalType(20, 2)),
+            ]
+        ),
+    )
+    assert test_data2.where(test_data2.a == test_data2.b).collect() == [
+        Row(A=Decimal("0.10"), B=Decimal("0.10"))
+    ]
+    assert test_data2.where(test_data2.a != test_data2.b).collect() == [
+        Row(A=Decimal("0.20"), B=Decimal("0.60")),
+        Row(A=Decimal("0.30"), B=Decimal("0.70")),
+    ]
 
 
 def test_gt_and_lt(session):
@@ -104,6 +139,15 @@ def test_gt_and_lt(session):
     ]
     assert test_data1.where(test_data1["NUM"] < 2).collect() == [Row(1, True, "a")]
     assert test_data1.where(test_data1["NUM"] < lit(2)).collect() == [Row(1, True, "a")]
+
+    test_data_datetime = TestData.datetime_primitives2(session)
+    res = datetime.datetime(2000, 5, 6, 0, 0, 0)
+    assert test_data_datetime.where(
+        test_data_datetime["timestamp"] > res
+    ).collect() == [Row(datetime.datetime(9999, 12, 31, 0, 0, 0, 123456))]
+    assert test_data_datetime.where(
+        test_data_datetime["timestamp"] < res
+    ).collect() == [Row(datetime.datetime(1583, 1, 1, 23, 59, 59, 567890))]
 
 
 def test_leq_and_geq(session):
@@ -124,8 +168,9 @@ def test_leq_and_geq(session):
     ]
 
 
+@multithreaded_run()
 def test_null_safe_operators(session):
-    df = session.sql("select * from values(null, 1),(2, 2),(null, null) as T(a,b)")
+    df = session.create_dataframe([[None, 1], [2, 2], [None, None]], schema=["a", "b"])
     assert df.select(df["A"].equal_null(df["B"])).collect() == [
         Row(False),
         Row(True),
@@ -134,8 +179,8 @@ def test_null_safe_operators(session):
 
 
 def test_nan_and_null(session):
-    df = session.sql(
-        "select * from values(1.1,1),(null,2),('NaN' :: Float,3) as T(a, b)"
+    df = session.create_dataframe(
+        [[1.1, 1], [None, 2], [math.nan, 3]], schema=["a", "b"]
     )
     res = df.where(df["A"].equal_nan()).collect()
     assert len(res) == 1
@@ -150,8 +195,8 @@ def test_nan_and_null(session):
 
 
 def test_and_or(session):
-    df = session.sql(
-        "select * from values(true,true),(true,false),(false,true),(false,false) as T(a, b)"
+    df = session.create_dataframe(
+        [[True, True], [True, False], [False, True], [False, False]], schema=["a", "b"]
     )
     assert df.where(df["A"] & df["B"]).collect() == [Row(True, True)]
     assert df.where(df["A"] | df["B"]).collect() == [
@@ -161,8 +206,9 @@ def test_and_or(session):
     ]
 
 
+@multithreaded_run()
 def test_add_subtract_multiply_divide_mod_pow(session):
-    df = session.sql("select * from values(11, 13) as T(a, b)")
+    df = session.create_dataframe([[11, 13]], schema=["a", "b"])
     assert df.select(df["A"] + df["B"]).collect() == [Row(24)]
     assert df.select(df["A"] - df["B"]).collect() == [Row(-2)]
     assert df.select(df["A"] * df["B"]).collect() == [Row(143)]
@@ -189,7 +235,7 @@ def test_cast(session):
     test_data1 = TestData.test_data1(session)
     sc = test_data1.select(test_data1["NUM"].cast(StringType())).schema
     assert len(sc.fields) == 1
-    assert sc.fields[0].column_identifier == '"CAST (""NUM"" AS STRING)"'
+    assert sc.fields[0].name == '"CAST (""NUM"" AS STRING)"'
     assert type(sc.fields[0].datatype) == StringType
     assert not sc.fields[0].nullable
 
@@ -240,8 +286,9 @@ def test_order(session):
     ]
 
 
+@multithreaded_run()
 def test_bitwise_operator(session):
-    df = session.sql("select * from values(1, 2) as T(a, b)")
+    df = session.create_dataframe([[1, 2]], schema=["a", "b"])
     assert df.select(df["A"].bitand(df["B"])).collect() == [Row(0)]
     assert df.select(df["A"].bitor(df["B"])).collect() == [Row(3)]
     assert df.select(df["A"].bitxor(df["B"])).collect() == [Row(3)]
@@ -377,6 +424,11 @@ def test_drop_columns_by_column(session):
     assert df.drop(df2["one"]).schema.fields[0].name == '"One"'
 
 
+@pytest.mark.xfail(
+    "config.getoption('local_testing_mode', default=False)",
+    reason="this tests fully qualified column name which is not supported by col() function",
+    run=False,
+)
 def test_fully_qualified_column_name(session):
     random_name = Utils.random_name_for_temp_object(TempObjectType.TABLE)
     schema = "{}.{}".format(
@@ -462,6 +514,11 @@ def test_column_constructors_select(session):
     assert "invalid identifier" in str(ex_info)
 
 
+@pytest.mark.xfail(
+    "config.getoption('local_testing_mode', default=False)",
+    reason="SQL expr feature not supported",
+    run=False,
+)
 def test_sql_expr_column(session):
     df = session.create_dataframe([[1, 2, 3]]).to_df("col", '"col"', "col .")
     assert df.select(sql_expr("col")).collect() == [Row(1)]
@@ -488,14 +545,26 @@ def test_sql_expr_column(session):
     assert "syntax error" in str(ex_info)
 
 
-def test_errors_for_aliased_columns(session):
+def test_errors_for_aliased_columns(session, local_testing_mode):
     df = session.create_dataframe([[1]]).to_df("c")
-    with pytest.raises(SnowparkSQLUnexpectedAliasException) as ex_info:
+    # TODO: align exc experience between local testing and snowflake
+    exc = (
+        SnowparkSQLUnexpectedAliasException
+        if not local_testing_mode
+        else SnowparkSQLException
+    )
+    with pytest.raises(exc) as ex_info:
         df.select(col("a").as_("b") + 10).collect()
-    assert "You can only define aliases for the root" in str(ex_info)
-    with pytest.raises(SnowparkSQLUnexpectedAliasException) as ex_info:
+    if not local_testing_mode:
+        assert "You can only define aliases for the root" in str(ex_info)
+    else:
+        assert "invalid identifier" in str(ex_info)
+    with pytest.raises(exc) as ex_info:
         df.group_by(col("a")).agg(avg(col("a").as_("b"))).collect()
-    assert "You can only define aliases for the root" in str(ex_info)
+    if not local_testing_mode:
+        assert "You can only define aliases for the root" in str(ex_info)
+    else:
+        assert "invalid identifier" in str(ex_info)
 
 
 def test_like(session):
@@ -513,21 +582,30 @@ def test_like(session):
     assert TestData.string4(session).where(col("A").like("")).collect() == []
 
 
-def test_subfield(session):
+def test_subfield(session, local_testing_mode):
     assert TestData.null_json1(session).select(col("v")["a"]).collect() == [
         Row("null"),
         Row('"foo"'),
         Row(None),
     ]
 
-    assert TestData.array2(session).select(col("arr1")[0]).collect() == [
-        Row("1"),
-        Row("6"),
-    ]
-    assert TestData.array2(session).select(parse_json(col("f"))[0]["a"]).collect() == [
-        Row("1"),
-        Row("1"),
-    ]
+    if not local_testing_mode:
+        assert TestData.array2(session).select(col("arr1")[0]).collect() == [
+            Row("1"),
+            Row("6"),
+        ]
+        assert TestData.array2(session).select(
+            parse_json(col("f"))[0]["a"]
+        ).collect() == [
+            Row("1"),
+            Row("1"),
+        ]
+    else:
+        # TODO: function array_construct is not supported in local testing
+        #  we use the array in variant2 for testing purpose
+        assert TestData.variant2(session).select(
+            col("src")["vehicle"][0]["extras"][1]
+        ).collect() == [Row('"paint protection"')]
 
     # Row name is not case-sensitive. field name is case-sensitive
     assert TestData.variant2(session).select(
@@ -563,11 +641,55 @@ def test_regexp(session):
     ]
     assert TestData.string4(session).where(col("A").regexp("%a%")).collect() == []
 
+    # Test flags - case sensitive
+    assert (
+        TestData.string4(session).where(col("A").regexp("AP.LE", "c")).collect() == []
+    )
+
+    # Test flags - case insensitive
+    assert TestData.string4(session).where(col("A").regexp("AP.LE", "i")).collect() == [
+        Row("apple")
+    ]
+
+    # Test flags - case multiline
+    assert TestData.string9(session).where(
+        col("A").regexp("foo.*bar.", "m")
+    ).collect() == [Row(A="foo\tbar2"), Row(A="foo\rbar3")]
+
+    # Test flags - case newline
+    assert TestData.string9(session).where(
+        col("A").regexp("foo.*bar.", "s")
+    ).collect() == [
+        Row(A="foo\nbar1"),
+        Row(A="foo\tbar2"),
+        Row(A="foo\rbar3"),
+        Row(A="foo\r\nbar4"),
+    ]
+
     with pytest.raises(SnowparkSQLException) as ex_info:
         TestData.string4(session).where(col("A").regexp("+*")).collect()
     assert "Invalid regular expression" in str(ex_info)
 
+    # Test when pattern is a column of literal strings
+    df = session.create_dataframe(
+        [
+            ["MATCH", "MATCH"],
+            ["MAT.*", "MATCH"],
+            [".*", "MATCH"],
+            ["NO_MATCH", "MATCH"],
+        ],
+        schema=["pattern", "content"],
+    )
 
+    assert df.select(
+        col("CONTENT").regexp(col("PATTERN")).alias("RESULT")
+    ).collect() == [Row(True), Row(True), Row(True), Row(False)]
+
+
+@pytest.mark.skipif(
+    "config.getoption('local_testing_mode', default=False)",
+    reason="FEAT: SNOW-1346957 collate feature not supported",
+)
 @pytest.mark.parametrize("spec", ["en_US-trim", "'en_US-trim'"])
 def test_collate(session, spec):
     Utils.check_answer(
@@ -581,7 +703,7 @@ def test_get_column_name(session):
     assert not (col("col") > 100).getName()
 
 
-def test_when_case(session):
+def test_when_case(session, local_testing_mode):
     assert TestData.null_data1(session).select(
         when(col("a").is_null(), lit(5))
         .when(col("a") == 1, lit(6))
@@ -605,7 +727,8 @@ def test_when_case(session):
         TestData.null_data1(session).select(
             when(col("a").is_null(), lit("a")).when(col("a") == 1, lit(6)).as_("a")
         ).collect()
-    assert "Numeric value 'a' is not recognized" in str(ex_info)
+    if not local_testing_mode:
+        assert "Numeric value 'a' is not recognized" in str(ex_info)
 
 
 def test_lit_contains_single_quote(session):
@@ -619,29 +742,29 @@ def test_in_expression_1_in_with_constant_value_list(session):
     ).to_df(["a", "b", "c", "d"])
 
     df1 = df.filter(col("a").in_(1, 2))
-    Utils.check_answer([Row(1, "a", 1, 1), Row(2, "b", 2, 2)], df1, sort=False)
+    Utils.check_answer(df1, [Row(1, "a", 1, 1), Row(2, "b", 2, 2)], sort=False)
 
     df2 = df.filter(~col("a").in_(lit(1), lit(2)))
-    Utils.check_answer([Row(3, "b", 33, 33)], df2, sort=False)
+    Utils.check_answer(df2, [Row(3, "b", 33, 33)], sort=False)
 
     df3 = df.select(col("a").in_(1, 2).as_("in_result"))
-    Utils.check_answer([Row(True), Row(True), Row(False)], df3, sort=False)
+    Utils.check_answer(df3, [Row(True), Row(True), Row(False)], sort=False)
 
     df4 = df.select(~col("a").in_(lit(1), lit(2)).as_("in_result"))
-    Utils.check_answer([Row(False), Row(False), Row(True)], df4, sort=False)
+    Utils.check_answer(df4, [Row(False), Row(False), Row(True)], sort=False)
 
     # Redo tests with list inputs
     df1 = df.filter(col("a").in_([1, 2]))
-    Utils.check_answer([Row(1, "a", 1, 1), Row(2, "b", 2, 2)], df1, sort=False)
+    Utils.check_answer(df1, [Row(1, "a", 1, 1), Row(2, "b", 2, 2)], sort=False)
 
     df2 = df.filter(~col("a").in_([lit(1), lit(2)]))
-    Utils.check_answer([Row(3, "b", 33, 33)], df2, sort=False)
+    Utils.check_answer(df2, [Row(3, "b", 33, 33)], sort=False)
 
     df3 = df.select(col("a").in_([1, 2]).as_("in_result"))
-    Utils.check_answer([Row(True), Row(True), Row(False)], df3, sort=False)
+    Utils.check_answer(df3, [Row(True), Row(True), Row(False)], sort=False)
 
     df4 = df.select(~col("a").in_([lit(1), lit(2)]).as_("in_result"))
-    Utils.check_answer([Row(False), Row(False), Row(True)], df4, sort=False)
+    Utils.check_answer(df4, [Row(False), Row(False), Row(True)], sort=False)
 
 
 def test_in_expression_2_in_with_subquery(session):
@@ -667,27 +790,109 @@ def test_in_expression_2_in_with_subquery(session):
     Utils.check_answer(df4, [Row(False), Row(True), Row(True)])
 
 
-def test_in_expression_4_negative_test_to_input_column_in_value_list(session):
+def test_in_expression_3_with_all_types(session, local_testing_mode):
+    schema = StructType(
+        [
+            StructField("id", LongType()),
+            StructField("string", StringType()),
+            StructField("byte", BinaryType()),
+            StructField("short", ShortType()),
+            StructField("int", IntegerType()),
+            StructField("float", FloatType()),
+            StructField("double", DoubleType()),
+            StructField("decimal", DecimalType(10, 3)),
+            StructField("boolean", BooleanType()),
+            StructField("timestamp", TimestampType(TimestampTimeZone.NTZ)),
+            StructField("date", DateType()),
+            StructField("time", TimeType()),
+        ]
+    )
+    now = datetime.datetime.now()
+    utcnow = datetime.datetime.utcnow()
+
+    first_row = [
+        1,
+        "one",
+        b"123",
+        123,
+        123,
+        12.34,
+        12.34,
+        Decimal("1.234"),
+        True,
+        now,
+        datetime.date(1989, 12, 7),
+        datetime.time(11, 11, 11),
+    ]
+    second_row = [
+        2,
+        "two",
+        b"456",
+        456,
+        456,
+        45.67,
+        45.67,
+        Decimal("4.567"),
+        False,
+        utcnow,
+        datetime.date(2018, 10, 31),
+        datetime.time(23, 23, 23),
+    ]
+
+    df = session.create_dataframe([first_row, second_row], schema=schema)
+    if local_testing_mode:
+        # There seems to be a bug in live connection with timestamp precision
+        Utils.check_answer(
+            df.filter(
+                col("id").isin([1])
+                & col("string").isin(["one"])
+                & col("byte").isin([b"123"])
+                & col("short").isin([123])
+                & col("int").isin([123])
+                & col("float").isin([12.34])
+                & col("double").isin([12.34])
+                & col("decimal").isin([Decimal("1.234")])
+                & col("boolean").isin([True])
+                & col("timestamp").isin([now])
+                & col("date").isin([datetime.date(1989, 12, 7)])
+                & col("time").isin([datetime.time(11, 11, 11)])
+            ),
+            [first_row],
+        )
+        # it is possible that utcnow is equal to now, e.g., in the github CI windows machine is configured so
+        Utils.check_answer(
+            df.filter(col("timestamp").isin([utcnow])),
+            [second_row] if now != utcnow else [first_row, second_row],
+        )
+    Utils.check_answer(df.filter(col("decimal").isin([Decimal("1.234")])), [first_row])
+    Utils.check_answer(df.filter(col("id").isin([2])), [second_row])
+    Utils.check_answer(df.filter(col("string").isin(["three"])), [])
+
+
+@pytest.mark.skipif(
+    "config.getoption('local_testing_mode', default=False)",
+    reason="in_() with Column object as input is not supported in local testing mode.",
+)
+def test_in_expression_4_input_column_in_value_list(session):
     df = session.create_dataframe(
-        [[1, "a", 1, 1], [2, "b", 2, 2], [3, "b", 33, 33]]
-    ).to_df(["a", "b", "c", "d"])
-
-    with pytest.raises(TypeError) as ex_info:
-        df.filter(col("a").in_([col("c")]))
-
-    assert (
-        "is not supported for the values parameter of the function in(). You must either "
-        "specify a sequence of literals or a DataFrame that represents a subquery."
-        in str(ex_info.value)
+        [[1, "a", 1], [2, "b", 2], [3, "b", 33]], schema=["a", "b", "c"]
     )
 
-    with pytest.raises(TypeError) as ex_info:
-        df.filter(col("a").in_([1, df["c"]]))
-
-    assert (
-        "is not supported for the values parameter of the function in(). You must either "
-        "specify a sequence of literals or a DataFrame that represents a subquery."
-        in str(ex_info.value)
+    Utils.check_answer(
+        df.select(col("a").in_([col("c")])), [Row(True), Row(True), Row(False)]
+    )
+    Utils.check_answer(
+        df.select(col("a").in_(df["c"])), [Row(True), Row(True), Row(False)]
+    )
+    Utils.check_answer(
+        df.select(~in_([col("a")], df["c"])), [Row(False), Row(False), Row(True)]
+    )
+    Utils.check_answer(
+        df.select(col("a").in_([3, df["c"]])), [Row(True), Row(True), Row(True)]
+    )
+    Utils.check_answer(
+        df.select(in_([col("a"), col("b")], [[1, "a"], [col("c"), "b"]])),
+        [Row(True), Row(False), Row(True)],
     )
 
     with pytest.raises(TypeError) as ex_info:
@@ -713,12 +918,12 @@ def test_in_expression_5_negative_test_that_sub_query_has_multiple_columns(sessi
 
 def test_in_expression_6_multiple_columns_with_const_values(session):
     df = session.create_dataframe(
-        [[1, "a", 1, 1], [2, "b", 2, 2], [3, "b", 33, 33]]
+        [[1, "a", -1, 1], [2, "b", -2, 2], [3, "b", 33, 33]]
     ).to_df("a", "b", "c", "d")
 
     # filter without NOT
     df1 = df.filter(in_([col("a"), col("b")], [[1, "a"], [2, "b"], [3, "c"]]))
-    Utils.check_answer(df1, [Row(1, "a", 1, 1), Row(2, "b", 2, 2)])
+    Utils.check_answer(df1, [Row(1, "a", -1, 1), Row(2, "b", -2, 2)])
 
     # filter with NOT
     df2 = df.filter(~in_([col("a"), col("b")], [[1, "a"], [2, "b"], [3, "c"]]))
@@ -726,13 +931,13 @@ def test_in_expression_6_multiple_columns_with_const_values(session):
 
     # select without NOT
     df3 = df.select(
-        in_([col("a"), col("c")], [[1, 1], [2, 2], [3, 3]]).as_("in_result")
+        in_([col("a"), col("c")], [[1, -1], [2, -2], [3, 3]]).as_("in_result")
     )
     Utils.check_answer(df3, [Row(True), Row(True), Row(False)])
 
     # select with NOT
     df4 = df.select(
-        ~in_([col("a"), col("c")], [[1, 1], [2, 2], [3, 3]]).as_("in_result")
+        ~in_([col("a"), col("c")], [[1, -1], [2, -2], [3, 3]]).as_("in_result")
     )
     Utils.check_answer(df4, [Row(False), Row(False), Row(True)])
 
@@ -758,21 +963,6 @@ def test_in_expression_7_multiple_columns_with_sub_query(session):
     # select with NOT
     df4 = df.select(~in_([col("a"), col("b")], df0).as_("in_result"))
     Utils.check_answer(df4, [Row(False), Row(False), Row(True)])
-
-
-def test_in_expression_8_negative_test_to_input_column_in_value_list(session):
-    df = session.create_dataframe(
-        [[1, "a", 1, 1], [2, "b", 2, 2], [3, "b", 33, 33]]
-    ).to_df("a", "b", "c", "d")
-
-    with pytest.raises(TypeError) as ex_info:
-        df.filter(in_([col("a"), col("b")], [[1, "a"], [col("c"), "b"]]))
-
-    assert (
-        "is not supported for the values parameter of the function in(). You must either "
-        "specify a sequence of literals or a DataFrame that represents a subquery."
-        in str(ex_info.value)
-    )
 
 
 def test_in_expression_9_negative_test_for_the_column_count_doesnt_match_the_value_list(
@@ -805,4 +995,69 @@ def test_in_expression_with_multiple_queries(session):
     df2 = session.create_dataframe([[1, "one"], [3, "three"]], schema=["a", "b"])
     Utils.check_answer(
         df2.select(col("a").in_(df1.select("a"))), [Row(True), Row(False)]
+    )
+
+
+@pytest.mark.xfail(
+    "config.getoption('local_testing_mode', default=False)",
+    reason="SNOW-1573222: Local testing does not handle nulls correctly in boolean expressions.",
+    run=False,
+)
+def test_in_expression_null_cases(session):
+    df = session.create_dataframe(
+        [[1, "a", 1, 1], [2, "b", 2, 2], [3, "b", 33, 33], [None, "c", 44, 44]]
+    ).to_df(["a", "b", "c", "d"])
+
+    # Check positive and negative literal cases.
+    df1 = df.select(col("a").in_(1, 2).as_("in_result"))
+    Utils.check_answer(df1, [Row(True), Row(True), Row(False), Row(None)], sort=False)
+
+    df2 = df.select(~col("a").in_(lit(1), lit(2)).as_("in_result"))
+    Utils.check_answer(df2, [Row(False), Row(False), Row(True), Row(None)], sort=False)
+
+    # Check positive and negative list cases.
+    df3 = df.select(col("a").in_([1, 2]).as_("in_result"))
+    Utils.check_answer(df3, [Row(True), Row(True), Row(False), Row(None)], sort=False)
+
+    df4 = df.select(~col("a").in_([lit(1), lit(2)]).as_("in_result"))
+    Utils.check_answer(df4, [Row(False), Row(False), Row(True), Row(None)], sort=False)
+
+    # Check empty list case
+    df5 = df.filter(col("a").in_([]))
+    Utils.check_answer(df5, [], sort=False)
+
+    # Check subquery cases
+    df0 = session.create_dataframe([[1], [2], [5]]).to_df(["a"])
+    df = session.create_dataframe(
+        [[1, "a", 1, 1], [2, "b", 2, 2], [3, "b", 33, 33]]
+    ).to_df(["a", "b", "c", "d"])
+
+    # filter
+    df1 = df.filter(col("a").in_(df0.filter(col("a") < 3)))
+    Utils.check_answer(df1, [Row(1, "a", 1, 1), Row(2, "b", 2, 2)])
+
+    # select with collect
+    df4 = df.select(df["a"].in_(df0.filter(col("a") > 100).collect()).as_("in_result"))
+    Utils.check_answer(df4, [Row(False), Row(False), Row(False)])
+
+
+@pytest.mark.skipif(
+    "config.getoption('local_testing_mode', default=False)",
+    reason="Pivot does not support values from subqueries yet.",
+)
+@pytest.mark.skipif(IS_IN_STORED_PROC, reason="pivot does not work in stored proc")
+def test_pivot_with_multiple_queries(session):
+    from snowflake.snowpark._internal.analyzer import analyzer
+
+    original_value = analyzer.ARRAY_BIND_THRESHOLD
+    try:
+        analyzer.ARRAY_BIND_THRESHOLD = 2
+        df1 = session.create_dataframe([[1, "one"], [2, "two"]], schema=["a", "b"])
+    finally:
+        analyzer.ARRAY_BIND_THRESHOLD = original_value
+    df2 = session.create_dataframe(
+        [[1, "one"], [11, "one"], [3, "three"]], schema=["a", "b"]
+    )
+    Utils.check_answer(
+        df2.pivot(col("b"), df1.select(col("b"))).agg(avg(col("a"))), [Row(6, None)]
     )

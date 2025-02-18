@@ -1,17 +1,33 @@
 #
-# Copyright (c) 2012-2022 Snowflake Computing Inc. All rights reserved.
+# Copyright (c) 2012-2025 Snowflake Computing Inc. All rights reserved.
 #
 
 import datetime
+import json
 from decimal import Decimal
 
-from snowflake.snowpark import Column, Row
-from snowflake.snowpark._internal.analyzer.expression import Literal
+import pytest
+
+from snowflake.snowpark import Row
+from snowflake.snowpark._internal.utils import PythonObjJSONEncoder
 from snowflake.snowpark.functions import lit
-from snowflake.snowpark.types import DecimalType
+from snowflake.snowpark.types import (
+    DecimalType,
+    LongType,
+    StructField,
+    StructType,
+    TimestampTimeZone,
+    TimestampType,
+    TimeType,
+    VariantType,
+)
 from tests.utils import Utils
 
 
+@pytest.mark.skipif(
+    "config.getoption('local_testing_mode', default=False)",
+    reason="SNOW-1362917: Schema inference not fully aligned for local testing mode.",
+)
 def test_literal_basic_types(session):
     df = (
         session.range(2)
@@ -30,8 +46,8 @@ def test_literal_basic_types(session):
     assert (
         field_str == "[StructField('ID', LongType(), nullable=False), "
         "StructField('NULL', StringType(), nullable=True), "
-        "StructField('STR', StringType(), nullable=False), "
-        "StructField('CHAR', StringType(), nullable=False), "
+        "StructField('STR', StringType(6), nullable=False), "
+        "StructField('CHAR', StringType(1), nullable=False), "
         "StructField('BOOL', BooleanType(), nullable=True), "
         "StructField('BYTES', BinaryType(), nullable=False), "
         "StructField('INT', LongType(), nullable=False), "
@@ -39,7 +55,7 @@ def test_literal_basic_types(session):
         "StructField('DECIMAL', DecimalType(38, 18), nullable=False)]"
     )
 
-    show_str = df._show_string(10)
+    show_str = df._show_string(10, _emit_ast=session.ast_enabled)
     assert (
         show_str
         == """------------------------------------------------------------------------------------------------------------
@@ -52,6 +68,10 @@ def test_literal_basic_types(session):
     )
 
 
+@pytest.mark.skipif(
+    "config.getoption('local_testing_mode', default=False)",
+    reason="SNOW-1362917: Schema inference not fully aligned for local testing mode.",
+)
 def test_literal_timestamp_and_instant(session):
     since_epoch = 1539259994.123  # equivalent to "2018-10-11 12:13:14.123"
     naive_datetime = datetime.datetime.utcfromtimestamp(since_epoch)
@@ -67,24 +87,31 @@ def test_literal_timestamp_and_instant(session):
         .with_column("naive_time", lit(naive_time))
         .with_column("aware_time", lit(aware_time))
     )
-    field_str = str(df.schema.fields)
-    assert (
-        field_str == "[StructField('ID', LongType(), nullable=False), "
-        "StructField('NAIVE_DATETIME', TimestampType(), nullable=False), "
-        "StructField('AWARE_DATETIME', TimestampType(), nullable=False), "
-        "StructField('NAIVE_TIME', TimeType(), nullable=False), "
-        "StructField('AWARE_TIME', TimeType(), nullable=False)]"
-    )
 
-    show_str = df._show_string(10)
+    expected_schema = StructType(
+        [
+            StructField("ID", LongType(), nullable=False),
+            StructField(
+                "NAIVE_DATETIME", TimestampType(TimestampTimeZone.NTZ), nullable=False
+            ),
+            StructField(
+                "AWARE_DATETIME", TimestampType(TimestampTimeZone.TZ), nullable=False
+            ),
+            StructField("NAIVE_TIME", TimeType(), nullable=False),
+            StructField("AWARE_TIME", TimeType(), nullable=False),
+        ]
+    )
+    Utils.is_schema_same(df.schema, expected_schema)
+
+    show_str = df._show_string(10, _emit_ast=session.ast_enabled)
     assert (
         show_str
-        == """------------------------------------------------------------------------------------------------------
-|"ID"  |"NAIVE_DATETIME"            |"AWARE_DATETIME"            |"NAIVE_TIME"     |"AWARE_TIME"     |
-------------------------------------------------------------------------------------------------------
-|0     |2018-10-11 12:13:14.123000  |2018-10-11 12:13:14.123000  |12:13:14.123000  |12:13:14.123000  |
-|1     |2018-10-11 12:13:14.123000  |2018-10-11 12:13:14.123000  |12:13:14.123000  |12:13:14.123000  |
-------------------------------------------------------------------------------------------------------
+        == """------------------------------------------------------------------------------------------------------------
+|"ID"  |"NAIVE_DATETIME"            |"AWARE_DATETIME"                  |"NAIVE_TIME"     |"AWARE_TIME"     |
+------------------------------------------------------------------------------------------------------------
+|0     |2018-10-11 12:13:14.123000  |2018-10-11 12:13:14.123000+00:00  |12:13:14.123000  |12:13:14.123000  |
+|1     |2018-10-11 12:13:14.123000  |2018-10-11 12:13:14.123000+00:00  |12:13:14.123000  |12:13:14.123000  |
+------------------------------------------------------------------------------------------------------------
 """
     )
 
@@ -101,7 +128,7 @@ def test_date(session):
         "StructField('DATE', DateType(), nullable=False)]"
     )
 
-    show_str = df._show_string(10)
+    show_str = df._show_string(10, _emit_ast=session.ast_enabled)
     assert (
         show_str
         == """---------------------
@@ -114,12 +141,16 @@ def test_date(session):
     )
 
 
+@pytest.mark.skipif(
+    "config.getoption('local_testing_mode', default=False)",
+    reason="SNOW-1362917: Schema inference not fully aligned for local testing mode.",
+)
 def test_special_literals(session):
     source_literal = lit(123)
     df = (
         session.range(2)
         .with_column("null", lit(None))
-        .with_column("literal", lit(source_literal))
+        .with_column("literal", source_literal)
     )
 
     assert (
@@ -129,7 +160,7 @@ def test_special_literals(session):
     )
 
     assert (
-        df._show_string(10)
+        df._show_string(10, _emit_ast=session.ast_enabled)
         == """
 -----------------------------
 |"ID"  |"NULL"  |"LITERAL"  |
@@ -142,13 +173,17 @@ def test_special_literals(session):
 
 
 # This test was originall party of scala-integ tests, but was removed.
+@pytest.mark.skipif(
+    "config.getoption('local_testing_mode', default=False)",
+    reason="SNOW-1362917: Schema inference not fully aligned for local testing mode.",
+)
 def test_special_decimal_literals(session):
     normal_scale = lit(Decimal("0.1"))
-    small_scale = Column(Literal(Decimal("0.00001"), DecimalType(5, 5)))
+    small_scale = lit(Decimal("0.00001"), DecimalType(5, 5))
 
     df = session.range(2).select(normal_scale, small_scale)
 
-    show_str = df._show_string(10)
+    show_str = df._show_string(10, _emit_ast=session.ast_enabled)
     assert (
         show_str
         == """-----------------------------------------------------------
@@ -161,12 +196,17 @@ def test_special_decimal_literals(session):
     )
 
 
+@pytest.mark.skipif(
+    "config.getoption('local_testing_mode', default=False)",
+    reason="SNOW-1362917: Schema inference not fully aligned for local testing mode.",
+)
 def test_array_object(session):
     df = (
         session.range(1)
         .with_column("list1", lit([1, 2, 3]))
         .with_column("list2", lit([]))
         .with_column("list3", lit([1, "1", 2.5, None]))
+        .with_column("list4", lit([datetime.date(2023, 4, 5)]))
         .with_column("tuple1", lit((1, 2, 3)))
         .with_column("tuple2", lit(()))
         .with_column("tuple3", lit((1, "1", 2.5, None)))
@@ -181,6 +221,7 @@ def test_array_object(session):
         "StructField('LIST1', ArrayType(StringType()), nullable=True), "
         "StructField('LIST2', ArrayType(StringType()), nullable=True), "
         "StructField('LIST3', ArrayType(StringType()), nullable=True), "
+        "StructField('LIST4', ArrayType(StringType()), nullable=True), "
         "StructField('TUPLE1', ArrayType(StringType()), nullable=True), "
         "StructField('TUPLE2', ArrayType(StringType()), nullable=True), "
         "StructField('TUPLE3', ArrayType(StringType()), nullable=True), "
@@ -195,6 +236,7 @@ def test_array_object(session):
             LIST1="[\n  1,\n  2,\n  3\n]",
             LIST2="[]",
             LIST3='[\n  1,\n  "1",\n  2.5,\n  null\n]',
+            LIST4='[\n  "2023-04-05"\n]',
             TUPLE1="[\n  1,\n  2,\n  3\n]",
             TUPLE2="[]",
             TUPLE3='[\n  1,\n  "1",\n  2.5,\n  null\n]',
@@ -203,3 +245,55 @@ def test_array_object(session):
             DICT3='{\n  "a": [\n    1,\n    "\'"\n  ],\n  "b": {\n    "1": null\n  }\n}',
         ),
     )
+
+
+@pytest.mark.skipif(
+    "config.getoption('local_testing_mode', default=False)",
+    reason="SNOW-1362917: Schema inference not fully aligned for local testing mode.",
+)
+def test_literal_variant(session):
+    LITERAL_VALUES = [
+        None,
+        1,
+        3.141,
+        "hello world",
+        True,
+        [1, 2, 3],
+        (2, 3, 4),
+        {4: 5, 6: 1},
+        {"a": 10},
+        datetime.datetime.now(),
+        datetime.date(2023, 4, 5),
+    ]
+    df = session.range(1)
+
+    for i, value in enumerate(LITERAL_VALUES):
+        df = df.with_column(f"x{i}", lit(value, VariantType()))
+
+    field_str = str(df.schema.fields)
+    ref_field_str = (
+        "[StructField('ID', LongType(), nullable=False), "
+        + ", ".join(
+            [
+                f"StructField('X{i}', VariantType(), nullable=True)"
+                for i in range(len(LITERAL_VALUES))
+            ]
+        )
+        + "]"
+    )
+    assert field_str == ref_field_str
+    kwargs = {
+        f"X{i}": json.dumps(value, cls=PythonObjJSONEncoder)
+        if value is not None
+        else None
+        for i, value in enumerate(LITERAL_VALUES)
+    }
+    ans = (
+        str(df.collect()[0])
+        .replace("\\n  ", "")
+        .replace("\\n", "")
+        .replace(", ", ",")
+        .replace(",", ", ")
+    )  # normalize Snowflake formatting for easier comparison
+    ref = str(Row(ID=0, **kwargs))
+    assert ans == ref

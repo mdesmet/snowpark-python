@@ -1,6 +1,7 @@
 #
-# Copyright (c) 2012-2022 Snowflake Computing Inc. All rights reserved.
+# Copyright (c) 2012-2025 Snowflake Computing Inc. All rights reserved.
 #
+
 import gzip
 import os
 import sys
@@ -17,6 +18,7 @@ from snowflake.snowpark._internal.utils import (
     normalize_local_file,
     normalize_remote_file_or_dir,
     result_set_to_rows,
+    split_path,
 )
 
 
@@ -127,7 +129,7 @@ class FileOperation:
                 )
                 raise ne.with_traceback(tb) from None
         else:
-            plan = self._session._plan_builder.file_operation_plan(
+            plan = self._session._analyzer.plan_builder.file_operation_plan(
                 "put",
                 normalize_local_file(local_file_name),
                 normalize_remote_file_or_dir(stage_location),
@@ -272,7 +274,7 @@ class FileOperation:
                 )
                 raise ne.with_traceback(tb) from None
         else:
-            stage_with_prefix, dest_filename = stage_location.rsplit("/", maxsplit=1)
+            stage_with_prefix, dest_filename = split_path(stage_location)
             put_result = self._session._conn.upload_stream(
                 input_stream=input_stream,
                 stage_location=stage_with_prefix,
@@ -337,7 +339,7 @@ class FileOperation:
         else:
             options = {"parallel": parallel}
             tmp_dir = tempfile.gettempdir()
-            src_file_name = stage_location.rsplit("/", maxsplit=1)[1]
+            src_file_name = split_path(stage_location)[1]
             local_file_name = os.path.join(tmp_dir, src_file_name)
             plan = self._session._plan_builder.file_operation_plan(
                 "get",

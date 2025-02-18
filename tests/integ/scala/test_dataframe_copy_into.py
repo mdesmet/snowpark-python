@@ -1,6 +1,7 @@
 #
-# Copyright (c) 2012-2022 Snowflake Computing Inc. All rights reserved.
+# Copyright (c) 2012-2025 Snowflake Computing Inc. All rights reserved.
 #
+
 import datetime
 import json
 from decimal import Decimal
@@ -9,7 +10,7 @@ from textwrap import dedent
 import pytest
 
 from snowflake.snowpark import Row, Session
-from snowflake.snowpark._internal.utils import TempObjectType
+from snowflake.snowpark._internal.utils import TempObjectType, parse_table_name
 from snowflake.snowpark.exceptions import (
     SnowparkDataframeException,
     SnowparkDataframeReaderException,
@@ -24,7 +25,12 @@ from snowflake.snowpark.types import (
     StructField,
     StructType,
 )
-from tests.utils import IS_IN_STORED_PROC, TestFiles, Utils
+from tests.utils import (
+    IS_IN_STORED_PROC,
+    TestFiles,
+    Utils,
+    iceberg_supported,
+)
 
 test_file_csv = "testCSV.csv"
 test_file2_csv = "test2CSV.csv"
@@ -69,33 +75,46 @@ def create_df_for_file_format(
 
 
 @pytest.fixture(scope="module")
-def tmp_stage_name1(session):
+def tmp_stage_name1(session, local_testing_mode):
     stage_name = Utils.random_stage_name()
-    Utils.create_stage(session, stage_name)
+    if not local_testing_mode:
+        Utils.create_stage(session, stage_name)
     try:
         yield stage_name
     finally:
-        Utils.drop_stage(session, stage_name)
+        if not local_testing_mode:
+            Utils.drop_stage(session, stage_name)
 
 
 @pytest.fixture(scope="module")
-def tmp_stage_name2(session):
+def tmp_stage_name2(session, local_testing_mode):
     stage_name = Utils.random_stage_name()
-    Utils.create_stage(session, stage_name)
+    if not local_testing_mode:
+        Utils.create_stage(session, stage_name)
     try:
         yield stage_name
     finally:
-        Utils.drop_stage(session, stage_name)
+        if not local_testing_mode:
+            Utils.drop_stage(session, stage_name)
 
 
 @pytest.fixture(scope="module")
 def tmp_table_name(session):
     table_name = Utils.random_name_for_temp_object(TempObjectType.TABLE)
-    Utils.create_table(session, table_name, "a Int, b String, c Double")
+    session.create_dataframe(
+        [],
+        StructType(
+            [
+                StructField("a", IntegerType()),
+                StructField("b", StringType()),
+                StructField("c", DoubleType()),
+            ]
+        ),
+    ).write.save_as_table(table_name)
     try:
         yield table_name
     finally:
-        Utils.drop_table(session, table_name)
+        session.table(table_name).drop_table()
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -181,6 +200,14 @@ def upload_files(session, tmp_stage_name1, tmp_stage_name2, resources_path):
     )
 
 
+pytestmark = [
+    pytest.mark.skipif(
+        "config.getoption('local_testing_mode', default=False)",
+        reason="SNOW-952138 DataFrame.copy_into_table is not supported in Local Testing",
+    )
+]
+
+
 def test_copy_csv_basic(session, tmp_stage_name1, tmp_table_name):
     test_file_on_stage = f"@{tmp_stage_name1}/{test_file_csv}"
     assert session.table(tmp_table_name).count() == 0
@@ -221,6 +248,36 @@ def test_copy_csv_basic(session, tmp_stage_name1, tmp_table_name):
             Row(2, "two", 2.2),
         ],
     )
+
+
+def test_copy_into_csv_iceberg(
+    session, tmp_stage_name1, tmp_table_name, local_testing_mode
+):
+    if not iceberg_supported(session, local_testing_mode):
+        pytest.skip("Test requires iceberg support.")
+    test_file_on_stage = f"@{tmp_stage_name1}/{test_file_csv}"
+    df = session.read.schema(user_schema).csv(test_file_on_stage)
+
+    test_table_name = Utils.random_name_for_temp_object(TempObjectType.TABLE)
+    df.copy_into_table(
+        test_table_name,
+        iceberg_config={
+            "external_volume": "PYTHON_CONNECTOR_ICEBERG_EXVOL",
+            "CATALOG": "SNOWFLAKE",
+            "BASE_LOCATION": "snowpark_python_tests",
+        },
+    )
+    try:
+        # Check that table is an iceberg table with correct properties set
+        ddl = session._run_query(f"select get_ddl('table', '{test_table_name}')")
+        assert (
+            ddl[0][0]
+            == f"create or replace ICEBERG TABLE {test_table_name} (\n\tA LONG,\n\tB STRING,\n\tC DOUBLE\n)\n EXTERNAL_VOLUME = 'PYTHON_CONNECTOR_ICEBERG_EXVOL'\n CATALOG = 'SNOWFLAKE'\n BASE_LOCATION = 'snowpark_python_tests/';"
+        )
+        # Check that a copy_into works on the newly created table.
+        df.copy_into_table(test_table_name)
+    finally:
+        Utils.drop_table(session, test_table_name)
 
 
 def test_copy_csv_create_table_if_not_exists(session, tmp_stage_name1):
@@ -466,7 +523,7 @@ def test_csv_read_format_name(session, tmp_stage_name1):
     temp_file_fmt_name = Utils.random_name_for_temp_object(TempObjectType.FILE_FORMAT)
     session.sql(
         f"create temporary file format {temp_file_fmt_name} type = csv skip_header=1 "
-        "null_if = 'none';"
+        "null_if = ('none','NA');"
     ).collect()
     df = (
         session.read.schema(
@@ -542,7 +599,9 @@ def test_json_read_format_name(session, tmp_stage_name1):
     )
 
     assert any(
-        f"FILE_FORMAT  => '{file_fmt_name}'" in q for q in sf_df.queries["queries"]
+        "CREATE SCOPED TEMPORARY FILE  FORMAT" in q
+        and "TYPE = 'json' NULL_IF = '' COMPRESSION = 'gzip'" in q
+        for q in sf_df.queries["queries"]
     )
 
     df = sf_df.collect()
@@ -918,8 +977,16 @@ def test_copy_non_csv_transformation(
                     C="a",
                     D=datetime.date(2022, 4, 1),
                     T=datetime.time(11, 11, 11),
-                    TS_NTZ=datetime.datetime(2022, 4, 1, 11, 11, 11),
-                    TS=datetime.datetime(2022, 4, 1, 11, 11, 11),
+                    TS_NTZ=datetime.datetime(
+                        2022, 4, 1, 11, 11, 11, tzinfo=datetime.timezone.utc
+                    )
+                    .astimezone()
+                    .replace(tzinfo=None),
+                    TS=datetime.datetime(
+                        2022, 4, 1, 11, 11, 11, tzinfo=datetime.timezone.utc
+                    )
+                    .astimezone()
+                    .replace(tzinfo=None),
                     V='{"key":"value"}',
                 )
             ],
@@ -1218,3 +1285,151 @@ def test_copy_into_table_non_csv_using_options(session, tmp_stage_name1):
         Utils.check_answer(session.table(table_name), assert_data * 2)
     finally:
         Utils.drop_table(session, table_name)
+
+
+@pytest.mark.skipif(
+    IS_IN_STORED_PROC,
+    reason="use schema is not allowed in stored proc (owner mode)",
+)
+def test_copy_into_table_names(session, db_parameters, tmp_stage_name1):
+    database = session.get_current_database().replace('"', "")
+    current_schema = session.get_current_schema().replace('"', "")
+    schema = f"schema_{Utils.random_alphanumeric_str(10)}"
+    double_quoted_schema = f'"{schema}.{schema}"'
+    test_file_on_stage = f"@{tmp_stage_name1}/{test_file_csv}"
+
+    def create_and_append_check_answer(table_name_input):
+        parsed_table_name_array = (
+            parse_table_name(table_name_input)
+            if isinstance(table_name_input, str)
+            else table_name_input
+        )
+        full_table_name_str = (
+            ".".join(table_name_input)
+            if not isinstance(table_name_input, str)
+            else table_name_input
+        )
+        try:
+            assert session._table_exists(parsed_table_name_array) is False
+            Utils.create_table(
+                session, full_table_name_str, "a Int, b String, c Double"
+            )
+            assert session._table_exists(parsed_table_name_array) is True
+            assert session.table(full_table_name_str).count() == 0
+
+            df = session.read.schema(user_schema).csv(test_file_on_stage)
+            df.copy_into_table(table_name_input)
+            Utils.check_answer(
+                session.table(table_name_input),
+                [Row(1, "one", 1.2), Row(2, "two", 2.2)],
+            )
+        finally:
+            session._run_query(f"drop table if exists {full_table_name_str}")
+
+    try:
+        Utils.create_schema(session, schema)
+        Utils.create_schema(session, double_quoted_schema)
+        session._run_query(f"use schema {current_schema}")
+        # basic scenario
+        table_name = f"{Utils.random_table_name()}"
+        create_and_append_check_answer(table_name)
+
+        # schema.table
+        create_and_append_check_answer(f"{schema}.{Utils.random_table_name()}")
+
+        # database.schema.table
+        create_and_append_check_answer(
+            f"{database}.{schema}.{Utils.random_table_name()}"
+        )
+
+        # database..table
+        create_and_append_check_answer(f"{database}..{Utils.random_table_name()}")
+
+        # table name containing dot (.)
+        table_name = f'"{Utils.random_table_name()}.{Utils.random_table_name()}"'
+        create_and_append_check_answer(table_name)
+
+        # table name containing quotes
+        table_name = f'"""{Utils.random_table_name()}"""'
+        create_and_append_check_answer(table_name)
+
+        # table name containing quotes and dot
+        table_name = f'"""{Utils.random_table_name()}...{Utils.random_table_name()}"""'
+        create_and_append_check_answer(table_name)
+
+        # quoted schema and quoted table
+
+        # "schema"."table"
+        table_name = f'"{Utils.random_table_name()}.{Utils.random_table_name()}"'
+        full_table_name = f"{double_quoted_schema}.{table_name}"
+        create_and_append_check_answer(full_table_name)
+
+        # db."schema"."table"
+        table_name = f'"{Utils.random_table_name()}.{Utils.random_table_name()}"'
+        full_table_name = f"{database}.{double_quoted_schema}.{table_name}"
+        create_and_append_check_answer(full_table_name)
+
+        # db.."table"
+        table_name = f'"{Utils.random_table_name()}.{Utils.random_table_name()}"'
+        full_table_name = f"{database}..{table_name}"
+        create_and_append_check_answer(full_table_name)
+
+        # schema + table name containing dots and quotes
+        table_name = f'"""{Utils.random_table_name()}...{Utils.random_table_name()}"""'
+        full_table_name = f"{schema}.{table_name}"
+        create_and_append_check_answer(full_table_name)
+
+        # test list of input table name
+        # table
+        create_and_append_check_answer([f"{Utils.random_table_name()}"])
+
+        # schema table
+        create_and_append_check_answer([schema, f"{Utils.random_table_name()}"])
+
+        # database schema table
+        create_and_append_check_answer(
+            [database, schema, f"{Utils.random_table_name()}"]
+        )
+
+        # database schema table
+        create_and_append_check_answer([database, "", f"{Utils.random_table_name()}"])
+
+        # quoted table
+        create_and_append_check_answer(
+            [f'"{Utils.random_table_name()}.{Utils.random_table_name()}"']
+        )
+
+        # quoted schema and quoted table
+        create_and_append_check_answer(
+            [
+                f"{double_quoted_schema}",
+                f'"{Utils.random_table_name()}.{Utils.random_table_name()}"',
+            ]
+        )
+
+        # db, quoted schema and quoted table
+        create_and_append_check_answer(
+            [
+                database,
+                f"{double_quoted_schema}",
+                f'"{Utils.random_table_name()}.{Utils.random_table_name()}"',
+            ]
+        )
+
+        # db, missing schema, quoted table
+        create_and_append_check_answer(
+            [database, "", f'"{Utils.random_table_name()}.{Utils.random_table_name()}"']
+        )
+
+        # db, missing schema, quoted table with escaping quotes
+        create_and_append_check_answer(
+            [
+                database,
+                "",
+                f'"""{Utils.random_table_name()}.{Utils.random_table_name()}"""',
+            ]
+        )
+    finally:
+        # drop schema
+        Utils.drop_schema(session, schema)
+        Utils.drop_schema(session, double_quoted_schema)

@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 #
-# Copyright (c) 2012-2022 Snowflake Computing Inc. All rights reserved.
+# Copyright (c) 2012-2025 Snowflake Computing Inc. All rights reserved.
 #
+
+from datetime import date
 from decimal import Decimal
 
 import pytest
@@ -41,7 +43,11 @@ from snowflake.snowpark.functions import (
 from tests.utils import TestData, Utils
 
 
-def test_partition_by_order_by_rows_between(session):
+@pytest.mark.skipif(
+    "config.getoption('local_testing_mode', default=False)",
+    reason="SNOW-1435114: windowed aggregations do not have a consistent precision in live.",
+)
+def test_partition_by_order_by_rows_between(session, local_testing_mode):
     df = session.create_dataframe(
         [(1, "1"), (2, "1"), (2, "2"), (1, "1"), (2, "2")]
     ).to_df("key", "value")
@@ -67,7 +73,7 @@ def test_partition_by_order_by_rows_between(session):
             Row(1, Decimal("1.666")),
             Row(1, Decimal("1.333")),
         ],
-        sort=False,
+        sort=local_testing_mode,
     )
 
 
@@ -94,6 +100,10 @@ def test_range_between(session):
     )
 
 
+@pytest.mark.skipif(
+    "config.getoption('local_testing_mode', default=False)",
+    reason="SNOW-1362852: Window functions need better alignment with live.",
+)
 def test_window_function_with_aggregates(session):
     df = session.create_dataframe(
         [("a", 1), ("a", 1), ("a", 2), ("a", 2), ("b", 4), ("b", 3), ("b", 2)]
@@ -107,6 +117,10 @@ def test_window_function_with_aggregates(session):
     )
 
 
+@pytest.mark.skipif(
+    "config.getoption('local_testing_mode', default=False)",
+    reason="SNOW-1362852: Window functions need better alignment with live.",
+)
 def test_window_function_inside_where_and_having_clauses(session):
     with pytest.raises(SnowparkSQLException) as ex_info:
         TestData.test_data2(session).select("a").where(
@@ -168,6 +182,10 @@ def test_reuse_window_order_by(session):
     )
 
 
+@pytest.mark.skipif(
+    "config.getoption('local_testing_mode', default=False)",
+    reason="ntile is not yet supported in local testing mode.",
+)
 def test_rank_functions_in_unspecific_window(session):
     df = session.create_dataframe([(1, "1"), (2, "2"), (1, "2"), (2, "2")]).to_df(
         "key", "value"
@@ -200,8 +218,6 @@ def test_empty_over_spec(session):
     df = session.create_dataframe([("a", 1), ("a", 1), ("a", 2), ("b", 2)]).to_df(
         "key", "value"
     )
-    view_name = Utils.random_name_for_temp_object(TempObjectType.VIEW)
-    df.create_or_replace_temp_view(view_name)
     Utils.check_answer(
         df.select("key", "value", sum_("value").over(), avg("value").over()),
         [
@@ -211,9 +227,12 @@ def test_empty_over_spec(session):
             Row("b", 2, 6, 1.5),
         ],
     )
+    view_name = Utils.random_name_for_temp_object(TempObjectType.VIEW)
+    df.create_or_replace_temp_view(view_name)
+
     Utils.check_answer(
-        session.sql(
-            f"select key, value, sum(value) over(), avg(value) over() from {view_name}"
+        session.table(view_name).select(
+            "key", "value", sum_("value").over(), avg("value").over()
         ),
         [
             Row("a", 1, 6, 1.5),
@@ -256,6 +275,34 @@ def test_window_function_should_fail_if_order_by_clause_is_not_specified(session
     assert "requires ORDER BY in window specification" in str(ex_info)
 
 
+def test_snow_1360263_repro(session):
+    data = [
+        Row(id=1, row_date=date(2024, 1, 1), value=1),
+        Row(id=2, row_date=date(2024, 1, 1), value=1),
+        Row(id=1, row_date=date(2024, 1, 2), value=1),
+        Row(id=1, row_date=date(2024, 1, 2), value=100),
+        Row(id=2, row_date=date(2024, 1, 2), value=1),
+    ]
+
+    test_data = session.create_dataframe(data)
+
+    # partition over id and row_date and get the records with the largest values
+    window = Window.partition_by("id", "row_date").order_by(col("value").desc())
+    df = test_data.with_column("row_num", row_number().over(window)).where(
+        col("row_num") == 1
+    )
+    assert df.order_by("ID", "ROW_DATE").collect() == [
+        Row(1, date(2024, 1, 1), 1, 1),
+        Row(1, date(2024, 1, 2), 100, 1),
+        Row(2, date(2024, 1, 1), 1, 1),
+        Row(2, date(2024, 1, 2), 1, 1),
+    ]
+
+
+@pytest.mark.skipif(
+    "config.getoption('local_testing_mode', default=False)",
+    reason="corr is not yet supported in local testing mode.",
+)
 def test_corr_covar_pop_stddev_pop_functions_in_specific_window(session):
     df = session.create_dataframe(
         [
@@ -318,6 +365,10 @@ def test_corr_covar_pop_stddev_pop_functions_in_specific_window(session):
     )
 
 
+@pytest.mark.skipif(
+    "config.getoption('local_testing_mode', default=False)",
+    reason="covar_samp is not yet supported in local testing mode.",
+)
 def test_covar_samp_var_samp_stddev_samp_functions_in_specific_window(session):
     df = session.create_dataframe(
         [
@@ -382,6 +433,10 @@ def test_aggregation_function_on_invalid_column(session):
     assert "invalid identifier" in str(ex_info)
 
 
+@pytest.mark.skipif(
+    "config.getoption('local_testing_mode', default=False)",
+    reason="skew is not yet supported in local testing mode.",
+)
 def test_skewness_and_kurtosis_functions_in_window(session):
     df = session.create_dataframe(
         [
@@ -413,17 +468,18 @@ def test_skewness_and_kurtosis_functions_in_window(session):
         ),
         # results are checked by scipy.stats.skew() and scipy.stats.kurtosis()
         [
-            Row("a", -0.353044463087872, -1.8166064369747783),
-            Row("b", -0.353044463087872, -1.8166064369747783),
-            Row("c", -0.353044463087872, -1.8166064369747783),
-            Row("d", -0.353044463087872, -1.8166064369747783),
-            Row("e", -0.353044463087872, -1.8166064369747783),
-            Row("f", -0.353044463087872, -1.8166064369747783),
-            Row("g", -0.353044463087872, -1.8166064369747783),
-            Row("h", 1.293342780733395, None),
-            Row("i", 1.293342780733395, None),
-            Row("j", 1.293342780733395, None),
+            Row("a", -0.353045, -1.816609),
+            Row("b", -0.353045, -1.816609),
+            Row("c", -0.353045, -1.816609),
+            Row("d", -0.353045, -1.816609),
+            Row("e", -0.353045, -1.816609),
+            Row("f", -0.353045, -1.816609),
+            Row("g", -0.353045, -1.816609),
+            Row("h", 1.293343, None),
+            Row("i", 1.293343, None),
+            Row("j", 1.293343, None),
         ],
+        float_equality_threshold=1e-5,
     )
 
 
@@ -433,11 +489,13 @@ def test_window_functions_in_multiple_selects(session):
     ).to_df("sno", "pno", "qty")
     w1 = Window.partition_by("sno")
     w2 = Window.partition_by("sno", "pno")
+
     select = df.select(
         "sno", "pno", "qty", sum_("qty").over(w2).alias("sum_qty_2")
     ).select(
         "sno", "pno", "qty", col("sum_qty_2"), sum_("qty").over(w1).alias("sum_qty_1")
     )
+
     Utils.check_answer(
         select,
         [
@@ -449,6 +507,10 @@ def test_window_functions_in_multiple_selects(session):
     )
 
 
+@pytest.mark.skipif(
+    "config.getoption('local_testing_mode', default=False)",
+    reason="Window function ListAgg is not supported",
+)
 def test_listagg_window_function(session):
     df = session.create_dataframe(
         [

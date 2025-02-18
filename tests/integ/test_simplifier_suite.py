@@ -1,35 +1,51 @@
 #
-# Copyright (c) 2012-2022 Snowflake Computing Inc. All rights reserved.
+# Copyright (c) 2012-2025 Snowflake Computing Inc. All rights reserved.
 #
-import math
-from typing import Iterable, Tuple
+
+import sys
+from typing import Tuple
 
 import pytest
 
-from snowflake.snowpark import Row, Window
+from snowflake.snowpark import Row
 from snowflake.snowpark._internal.analyzer.select_statement import (
     SET_EXCEPT,
     SET_INTERSECT,
     SET_UNION,
     SET_UNION_ALL,
 )
-from snowflake.snowpark._internal.utils import TempObjectType
 from snowflake.snowpark.exceptions import SnowparkSQLException
 from snowflake.snowpark.functions import (
     avg,
-    call_udf,
     col,
-    count_distinct,
+    iff,
     lit,
-    rank,
+    min as min_,
+    object_construct_keep_null,
+    row_number,
+    seq1,
     sql_expr,
     sum as sum_,
     table_function,
     udtf,
-    upper,
 )
-from snowflake.snowpark.types import FloatType
 from tests.utils import TestData, Utils
+
+# Python 3.8 needs to use typing.Iterable because collections.abc.Iterable is not subscriptable
+# Python 3.9 can use both
+# Python 3.10 needs to use collections.abc.Iterable because typing.Iterable is removed
+if sys.version_info <= (3, 9):
+    from typing import Iterable
+else:
+    from collections.abc import Iterable
+
+pytestmark = [
+    pytest.mark.xfail(
+        "config.getoption('local_testing_mode', default=False)",
+        reason="This is a SQL test suite",
+        run=False,
+    )
+]
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -41,11 +57,43 @@ def skip(pytestconfig):
         )
 
 
+boolParamList = [True, False]
+
+
+@pytest.fixture(params=boolParamList)
+def setup_reduce_cast(request, session):
+    is_eliminate_numeric_sql_value_cast_enabled = (
+        session.eliminate_numeric_sql_value_cast_enabled
+    )
+    session.eliminate_numeric_sql_value_cast_enabled = request.param
+    yield
+    session.eliminate_numeric_sql_value_cast_enabled = (
+        is_eliminate_numeric_sql_value_cast_enabled
+    )
+
+
 @pytest.fixture(scope="module")
 def simplifier_table(session) -> None:
     table_name = Utils.random_table_name()
     Utils.create_table(session, table_name, "a int, b int")
     session._conn.run_query(f"insert into {table_name}(a, b) values (1, 2)")
+    yield table_name
+    Utils.drop_table(session, table_name)
+
+
+@pytest.fixture(scope="module")
+def distinct_table(session):
+    table_name = Utils.random_table_name()
+    data = [
+        [5, "a"],
+        [3, "b"],
+        [5, "a"],
+        [1, "c"],
+        [3, "c"],
+    ]
+    session.create_dataframe(data, schema=["a", "b"]).write.save_as_table(
+        table_name, table_type="temp", mode="overwrite"
+    )
     yield table_name
     Utils.drop_table(session, table_name)
 
@@ -79,6 +127,56 @@ def test_set_same_operator(session, set_operator):
     assert (
         query1
         == f"(SELECT 1 as a, 2 as b){set_operator}(SELECT 2 as a, 2 as b){set_operator}((SELECT 3 as a, 2 as b){set_operator}(SELECT 4 as a, 2 as b))"
+    )
+
+
+@pytest.mark.parametrize(
+    "operator,action",
+    [
+        (SET_UNION, lambda df1, df2: df1.union(df2)),
+        (SET_UNION_ALL, lambda df1, df2: df1.union_all(df2)),
+        (SET_EXCEPT, lambda df1, df2: df1.except_(df2)),
+        (SET_INTERSECT, lambda df1, df2: df1.intersect(df2)),
+    ],
+)
+def test_distinct_set_operator(session, distinct_table, action, operator):
+    df1 = session.table(distinct_table)
+    df2 = session.table(distinct_table)
+
+    df = action(df1, df2.distinct())
+    assert (
+        df.queries["queries"][0]
+        == f"""( SELECT  *  FROM {distinct_table}){operator}( SELECT  DISTINCT  *  FROM {distinct_table})"""
+    )
+
+    df = action(df1.distinct(), df2)
+    assert (
+        df.queries["queries"][0]
+        == f"""( SELECT  DISTINCT  *  FROM {distinct_table}){operator}( SELECT  *  FROM {distinct_table})"""
+    )
+
+    df = action(df1, df2).distinct()
+    assert (
+        df.queries["queries"][0]
+        == f"""SELECT  DISTINCT  *  FROM (( SELECT  *  FROM {distinct_table}){operator}( SELECT  *  FROM {distinct_table}))"""
+    )
+
+    df = action(df1, df2.distinct()).distinct()
+    assert (
+        df.queries["queries"][0]
+        == f"""SELECT  DISTINCT  *  FROM (( SELECT  *  FROM {distinct_table}){operator}( SELECT  DISTINCT  *  FROM {distinct_table}))"""
+    )
+
+    df = action(df1.distinct(), df2).distinct()
+    assert (
+        df.queries["queries"][0]
+        == f"""SELECT  DISTINCT  *  FROM (( SELECT  DISTINCT  *  FROM {distinct_table}){operator}( SELECT  *  FROM {distinct_table}))"""
+    )
+
+    df = action(df1.distinct(), df2.distinct()).distinct()
+    assert (
+        df.queries["queries"][0]
+        == f"""SELECT  DISTINCT  *  FROM (( SELECT  DISTINCT  *  FROM {distinct_table}){operator}( SELECT  DISTINCT  *  FROM {distinct_table}))"""
     )
 
 
@@ -171,6 +269,37 @@ def test_union_by_name(session):
     assert get_max_nesting_depth(df_n1.queries["queries"][-1]) == get_max_nesting_depth(
         df_n2.queries["queries"][-1]
     )
+
+
+def test_union_with_cache_result(session):
+    """Created to test regression in SNOW-876321"""
+    df = session.sql("select 1 as A, 2 as B")
+    df1 = df.select(lit("foo").alias("lit_col"))
+    df2 = df.select(lit("eggs").alias("lit_col"))
+    df3 = df1.union(df2)
+
+    df4 = df3.cache_result()
+    Utils.check_answer(df4, [Row(LIT_COL="foo"), Row(LIT_COL="eggs")])
+
+
+def test_set_after_set(session):
+    df = session.createDataFrame([(1, "one"), (2, "two"), (3, "one"), (4, "two")])
+    df2 = session.createDataFrame([(3, "one"), (4, "two")])
+
+    df_new = df.subtract(df2).with_column("NEW_COLUMN", lit(True))
+    df_new_2 = df.subtract(df2).with_column("NEW_COLUMN", lit(True))
+    df_union = df_new.union_all(df_new_2)
+    Utils.check_answer(
+        df_union,
+        [
+            Row(1, "one", True),
+            Row(1, "one", True),
+            Row(2, "two", True),
+            Row(2, "two", True),
+        ],
+        sort=True,
+    )
+    assert df_union.columns == ["_1", "_2", "NEW_COLUMN"]
 
 
 def test_select_new_columns(session, simplifier_table):
@@ -367,6 +496,7 @@ def test_select_expr(session, simplifier_table):
     assert df11.queries["queries"][-1].count("SELECT") == 2
 
 
+@pytest.mark.udf
 def test_select_with_table_function_join(session):
     # setup
     df = session.create_dataframe(
@@ -438,6 +568,7 @@ def test_select_with_table_function_join(session):
     )
 
 
+@pytest.mark.udf
 def test_join_table_function(session):
     # setup
     df = session.create_dataframe(
@@ -590,14 +721,17 @@ def test_reference_non_exist_columns(session, simplifier_table):
         df.select(col("c") + 1).collect()
 
 
-def test_order_by(session, simplifier_table):
+def test_order_by(setup_reduce_cast, session, simplifier_table):
     df = session.table(simplifier_table)
 
     # flatten
     df1 = df.sort("a", col("b") + 1)
+    integer_literal_postfix = (
+        "" if session.eliminate_numeric_sql_value_cast_enabled else " :: INT"
+    )
     assert (
         df1.queries["queries"][-1]
-        == f'SELECT  *  FROM {simplifier_table} ORDER BY "A" ASC NULLS FIRST, ("B" + 1 :: INT) ASC NULLS FIRST'
+        == f'SELECT  *  FROM {simplifier_table} ORDER BY "A" ASC NULLS FIRST, ("B" + 1{integer_literal_postfix}) ASC NULLS FIRST'
     )
 
     # flatten
@@ -618,7 +752,7 @@ def test_order_by(session, simplifier_table):
     df4 = df.select((col("a") + 1).as_("a"), ((col("b") + 1).as_("b"))).sort("a", "b")
     assert (
         df4.queries["queries"][-1]
-        == f'SELECT  *  FROM ( SELECT ("A" + 1 :: INT) AS "A", ("B" + 1 :: INT) AS "B" FROM {simplifier_table}) ORDER BY "A" ASC NULLS FIRST, "B" ASC NULLS FIRST'
+        == f'SELECT  *  FROM ( SELECT ("A" + 1{integer_literal_postfix}) AS "A", ("B" + 1{integer_literal_postfix}) AS "B" FROM {simplifier_table}) ORDER BY "A" ASC NULLS FIRST, "B" ASC NULLS FIRST'
     )
 
     # subquery has sql text so unable to figure out same-level dependency, so assuming d depends on c. No flatten.
@@ -629,21 +763,24 @@ def test_order_by(session, simplifier_table):
     )
 
 
-def test_filter(session, simplifier_table):
+def test_filter(setup_reduce_cast, session, simplifier_table):
     df = session.table(simplifier_table)
+    integer_literal_postfix = (
+        "" if session.eliminate_numeric_sql_value_cast_enabled else " :: INT"
+    )
 
     # flatten
     df1 = df.filter((col("a") > 1) & (col("b") > 2))
     assert (
         df1.queries["queries"][-1]
-        == f'SELECT  *  FROM {simplifier_table} WHERE (("A" > 1 :: INT) AND ("B" > 2 :: INT))'
+        == f'SELECT  *  FROM {simplifier_table} WHERE (("A" > 1{integer_literal_postfix}) AND ("B" > 2{integer_literal_postfix}))'
     )
 
     # flatten
     df2 = df.select("a", "b").filter((col("a") > 1) & (col("b") > 2))
     assert (
         df2.queries["queries"][-1]
-        == f'SELECT "A", "B" FROM {simplifier_table} WHERE (("A" > 1 :: INT) AND ("B" > 2 :: INT))'
+        == f'SELECT "A", "B" FROM {simplifier_table} WHERE (("A" > 1{integer_literal_postfix}) AND ("B" > 2{integer_literal_postfix}))'
     )
 
     # no flatten because c is a new column
@@ -652,7 +789,7 @@ def test_filter(session, simplifier_table):
     )
     assert (
         df3.queries["queries"][-1]
-        == f'SELECT  *  FROM ( SELECT "A", "B", ("A" - "B") AS "C" FROM {simplifier_table}) WHERE ((("A" > 1 :: INT) AND ("B" > 2 :: INT)) AND ("C" < 1 :: INT))'
+        == f'SELECT  *  FROM ( SELECT "A", "B", ("A" - "B") AS "C" FROM {simplifier_table}) WHERE ((("A" > 1{integer_literal_postfix}) AND ("B" > 2{integer_literal_postfix})) AND ("C" < 1{integer_literal_postfix}))'
     )
 
     # no flatten because a and be are changed
@@ -661,13 +798,13 @@ def test_filter(session, simplifier_table):
     )
     assert (
         df4.queries["queries"][-1]
-        == f'SELECT  *  FROM ( SELECT ("A" + 1 :: INT) AS "A", ("B" + 1 :: INT) AS "B" FROM {simplifier_table}) WHERE (("A" > 1 :: INT) AND ("B" > 2 :: INT))'
+        == f'SELECT  *  FROM ( SELECT ("A" + 1{integer_literal_postfix}) AS "A", ("B" + 1{integer_literal_postfix}) AS "B" FROM {simplifier_table}) WHERE (("A" > 1{integer_literal_postfix}) AND ("B" > 2{integer_literal_postfix}))'
     )
 
     df5 = df4.select("a")
     assert (
         df5.queries["queries"][-1]
-        == f'SELECT "A" FROM ( SELECT  *  FROM ( SELECT ("A" + 1 :: INT) AS "A", ("B" + 1 :: INT) AS "B" FROM {simplifier_table}) WHERE (("A" > 1 :: INT) AND ("B" > 2 :: INT)))'
+        == f'SELECT "A" FROM ( SELECT ("A" + 1{integer_literal_postfix}) AS "A", ("B" + 1{integer_literal_postfix}) AS "B" FROM {simplifier_table}) WHERE (("A" > 1{integer_literal_postfix}) AND ("B" > 2{integer_literal_postfix}))'
     )
 
     # subquery has sql text so unable to figure out same-level dependency, so assuming d depends on c. No flatten.
@@ -676,11 +813,11 @@ def test_filter(session, simplifier_table):
     )
     assert (
         df6.queries["queries"][-1]
-        == f'SELECT  *  FROM ( SELECT "A", "B", 3 :: INT AS "C", 1 + 1 as d FROM ( SELECT  *  FROM {simplifier_table})) WHERE ("A" > 1 :: INT)'
+        == f'SELECT  *  FROM ( SELECT "A", "B", 3 :: INT AS "C", 1 + 1 as d FROM ( SELECT  *  FROM {simplifier_table})) WHERE ("A" > 1{integer_literal_postfix})'
     )
 
 
-def test_limit(session, simplifier_table):
+def test_limit(setup_reduce_cast, session, simplifier_table):
     df = session.table(simplifier_table)
     df = df.limit(10)
     assert df.queries["queries"][-1] == f"SELECT  *  FROM {simplifier_table} LIMIT 10"
@@ -694,19 +831,103 @@ def test_limit(session, simplifier_table):
         == f"SELECT  *  FROM (select * from {simplifier_table}) LIMIT 10"
     )
 
+    # test for non-select sql statement
+    temp_table_name = Utils.random_table_name()
+    query = f"create or replace temporary table {temp_table_name} (bar string)"
+    df = session.sql(query).limit(1)
+    assert df.queries["queries"][-2] == query
+    assert df.collect()[0][0] == f"Table {temp_table_name} successfully created."
 
-def test_filter_order_limit_together(session, simplifier_table):
+
+def test_filter_order_limit_together(setup_reduce_cast, session, simplifier_table):
     df = session.table(simplifier_table)
     df1 = df.select("a", "b").filter(col("b") > 1).sort("a").limit(5)
+    integer_literal_postfix = (
+        "" if session.eliminate_numeric_sql_value_cast_enabled else " :: INT"
+    )
+
     assert (
         df1.queries["queries"][-1]
-        == f'SELECT "A", "B" FROM {simplifier_table} WHERE ("B" > 1 :: INT) ORDER BY "A" ASC NULLS FIRST LIMIT 5'
+        == f'SELECT "A", "B" FROM {simplifier_table} WHERE ("B" > 1{integer_literal_postfix}) ORDER BY "A" ASC NULLS FIRST LIMIT 5'
     )
 
     df2 = df1.select("a")
     assert (
         df2.queries["queries"][-1]
-        == f'SELECT "A" FROM ( SELECT "A", "B" FROM {simplifier_table} WHERE ("B" > 1 :: INT) ORDER BY "A" ASC NULLS FIRST LIMIT 5)'
+        == f'SELECT "A" FROM {simplifier_table} WHERE ("B" > 1{integer_literal_postfix}) ORDER BY "A" ASC NULLS FIRST LIMIT 5'
+    )
+
+
+def test_order_limit_filter(setup_reduce_cast, session, simplifier_table):
+    df = session.table(simplifier_table)
+    df1 = df.select("a", "b").sort("a").limit(1).filter(col("b") > 1)
+    integer_literal_postfix = (
+        "" if session.eliminate_numeric_sql_value_cast_enabled else " :: INT"
+    )
+
+    assert (
+        df1.queries["queries"][-1]
+        == f'SELECT  *  FROM ( SELECT "A", "B" FROM {simplifier_table} ORDER BY "A" ASC NULLS FIRST LIMIT 1) WHERE ("B" > 1{integer_literal_postfix})'
+    )
+
+    df2 = df1.select("a")
+    assert (
+        df2.queries["queries"][-1]
+        == f'SELECT "A" FROM ( SELECT "A", "B" FROM {simplifier_table} ORDER BY "A" ASC NULLS FIRST LIMIT 1) WHERE ("B" > 1{integer_literal_postfix})'
+    )
+
+
+def test_limit_window(session, simplifier_table):
+    df = session.table(simplifier_table)
+    df1 = df.select("a", "b").limit(1).select("a", "b", row_number().over())
+    assert (
+        df1.queries["queries"][-1]
+        == f'SELECT "A", "B", row_number() OVER (  ) FROM ( SELECT "A", "B" FROM {simplifier_table} LIMIT 1)'
+    )
+
+    df2 = df1.select("a")
+    assert (
+        df2.queries["queries"][-1]
+        == f'SELECT "A" FROM ( SELECT "A", "B" FROM {simplifier_table} LIMIT 1)'
+    )
+
+
+def test_limit_offset(session, simplifier_table):
+    df = session.table(simplifier_table)
+    df = df.limit(10, offset=1)
+    assert (
+        df.queries["queries"][-1]
+        == f"SELECT  *  FROM {simplifier_table} LIMIT 10 OFFSET 1"
+    )
+
+    df2 = df.limit(6)
+    assert (
+        df2.queries["queries"][-1]
+        == f"SELECT  *  FROM {simplifier_table} LIMIT 6 OFFSET 1"
+    )
+
+    df3 = df.limit(5, offset=2)
+    print(df3.queries)
+    assert (
+        df3.queries["queries"][-1]
+        == f"SELECT  *  FROM ( SELECT  *  FROM {simplifier_table} LIMIT 10 OFFSET 1) "
+        f"LIMIT 5 OFFSET 2"
+    )
+
+    df4 = session.sql(f"select * from {simplifier_table}")
+    df4 = df4.limit(10)
+    # we don't know if the original sql already has top/limit clause using a subquery is necessary.
+    #  or else there will be SQL compile error.
+    assert (
+        df4.queries["queries"][-1]
+        == f"SELECT  *  FROM (select * from {simplifier_table}) LIMIT 10"
+    )
+
+    df5 = df4.limit(5, offset=20)
+    assert (
+        df5.queries["queries"][-1]
+        == f"SELECT  *  FROM ( SELECT  *  FROM (select * from {simplifier_table}) LIMIT 10) "
+        f"LIMIT 5 OFFSET 20"
     )
 
 
@@ -752,6 +973,31 @@ def test_pivot(session):
         .select("EMPID")
     )
     assert df.queries["queries"][0].count("SELECT") == 4
+
+
+def test_group_by_pivot(session):
+    df = (
+        TestData.monthly_sales_with_team(session)
+        .group_by("empid")
+        .pivot("month", ["JAN", "FEB", "MAR", "APR"])
+        .agg(sum_(col("amount")))
+        .select("EMPID")
+        .select("EMPID")
+        .select("EMPID")
+    )
+    assert df.queries["queries"][0].count("SELECT") == 5
+    df = (
+        TestData.monthly_sales_with_team(session)
+        .select("EMPID", "team", "month", "amount")
+        .select("EMPID", "team", "month", "amount")
+        .group_by("empid")
+        .pivot("month", ["JAN", "FEB", "MAR", "APR"])
+        .agg(sum_(col("amount")))
+        .select("EMPID")
+        .select("EMPID")
+        .select("EMPID")
+    )
+    assert df.queries["queries"][0].count("SELECT") == 5
 
 
 @pytest.mark.parametrize("func_name", ["cube", "rollup"])
@@ -992,124 +1238,267 @@ def test_rename_to_existing_column_column(session):
     Utils.check_answer(df4, [Row(3, 3, 1)])
 
 
-def test_window_function_and_cast_column_name(session):
+def test_chained_sort(session):
+    session.sql_simplifier_enabled = False
+    df1 = session.create_dataframe([[1, 2], [4, 3]], schema=["a", "b"])
+
     session.sql_simplifier_enabled = True
-    df1 = session.sql('select 1 as " A"')
-    assert df1._output[0].name == '" A"'
-    assert df1.columns[0] == '" A"'
-    df2 = df1.select(
-        (rank().over(Window.order_by('" A"').range_between(1, 2)) - 1).cast(FloatType())
-    )
+    df2 = session.create_dataframe([[1, 2], [4, 3]], schema=["a", "b"])
+
+    Utils.check_answer(df1.sort("a").sort("b"), df2.sort("a").sort("b"), sort=False)
     assert (
-        df2._output[0].name
-        == '"CAST ((RANK() OVER (  ORDER BY "" A"" ASC NULLS FIRST  RANGE BETWEEN 1 FOLLOWING  AND 2 FOLLOWING  ) - 1 :: INT) AS FLOAT)"'
+        df2.sort("a").sort("b").queries["queries"][0]
+        == df2.sort("b", "a").queries["queries"][0]
     )
-    assert (
-        df2.columns[0]
-        == '"CAST ((RANK() OVER (  ORDER BY "" A"" ASC NULLS FIRST  RANGE BETWEEN 1 FOLLOWING  AND 2 FOLLOWING  ) - 1 :: INT) AS FLOAT)"'
+
+
+@pytest.mark.parametrize(
+    "operation,simplified_query",
+    [
+        # Flattened
+        (
+            lambda df: df.filter(col("A") > 1).select(col("B") + 1),
+            'SELECT ("B" + 1{POSTFIX}) FROM ( SELECT $1 AS "A", $2 AS "B" FROM  VALUES (1 :: INT, -2 :: INT), (3 :: INT, -4 :: INT)) WHERE ("A" > 1{POSTFIX})',
+        ),
+        # Flattened, if there are duplicate column names across the parent/child, WHERE is evaluated on subquery first, so we could flatten in this case
+        (
+            lambda df: df.filter(col("A") > 1).select((col("B") + 1).alias("A")),
+            'SELECT ("B" + 1{POSTFIX}) AS "A" FROM ( SELECT $1 AS "A", $2 AS "B" FROM  VALUES (1 :: INT, -2 :: INT), (3 :: INT, -4 :: INT)) WHERE ("A" > 1{POSTFIX})',
+        ),
+        # Flattened
+        (
+            lambda df: df.filter(col("A") > 1)
+            .select(col("A"), col("B"), lit(12).alias("TWELVE"))
+            .filter(col("A") > 2),
+            'SELECT "A", "B", 12 :: INT AS "TWELVE" FROM ( SELECT $1 AS "A", $2 AS "B" FROM  VALUES (1 :: INT, -2 :: INT), (3 :: INT, -4 :: INT)) WHERE (("A" > 1{POSTFIX}) AND ("A" > 2{POSTFIX}))',
+        ),
+        # Not fully flattened, since col("A") > 1 and col("A") > 2 are referring to different columns
+        (
+            lambda df: df.filter(col("A") > 1)
+            .select((col("B") + 1).alias("A"))
+            .filter(col("A") > 2),
+            'SELECT  *  FROM ( SELECT ("B" + 1{POSTFIX}) AS "A" FROM ( SELECT $1 AS "A", $2 AS "B" FROM  VALUES (1 :: INT, -2 :: INT), (3 :: INT, -4 :: INT)) WHERE ("A" > 1{POSTFIX})) WHERE ("A" > 2{POSTFIX})',
+        ),
+        # Not flattened, since A is updated in the select after filter.
+        (
+            lambda df: df.filter(col("A") > 1).select("A", seq1(0)),
+            'SELECT "A", seq1(0) FROM ( SELECT "A", "B" FROM ( SELECT $1 AS "A", $2 AS "B" FROM  VALUES (1 :: INT, -2 :: INT), (3 :: INT, -4 :: INT)) WHERE ("A" > 1{POSTFIX}))',
+        ),
+        # Not flattened, since we cannot detect dependent columns from sql_expr
+        (
+            lambda df: df.filter(sql_expr("A > 1")).select(col("B"), col("A")),
+            'SELECT "B", "A" FROM ( SELECT "A", "B" FROM ( SELECT $1 AS "A", $2 AS "B" FROM  VALUES (1 :: INT, -2 :: INT), (3 :: INT, -4 :: INT)) WHERE A > 1)',
+        ),
+        # Not flattened, since we cannot flatten when the subquery uses positional parameter ($1)
+        (
+            lambda df: df.filter(col("$1") > 1).select(col("B"), col("A")),
+            'SELECT "B", "A" FROM ( SELECT  *  FROM ( SELECT "A", "B" FROM ( SELECT $1 AS "A", $2 AS "B" FROM  VALUES (1 :: INT, -2 :: INT), (3 :: INT, -4 :: INT))) WHERE ("$1" > 1{POSTFIX}))',
+        ),
+    ],
+)
+def test_select_after_filter(setup_reduce_cast, session, operation, simplified_query):
+    session.sql_simplifier_enabled = False
+    df1 = session.create_dataframe([[1, -2], [3, -4]], schema=["a", "b"])
+
+    session.sql_simplifier_enabled = True
+    df2 = session.create_dataframe([[1, -2], [3, -4]], schema=["a", "b"])
+
+    # replace 'POSTFIX' with the expected integer literal postfix to get the final expected simplified query
+    integer_literal_postfix = (
+        "" if session.eliminate_numeric_sql_value_cast_enabled else " :: INT"
     )
-    df3 = df2.select(col(df2._output[0].name).alias("B"))
-    assert df3._output[0].name == '"B"'
-    assert df3.columns[0] == "B"
+    simplified_query = simplified_query.format_map({"POSTFIX": integer_literal_postfix})
+
+    Utils.check_answer(operation(df1), operation(df2))
+    assert operation(df2).queries["queries"][0] == simplified_query
 
 
-def test_cast_nan_column_name(session):
+@pytest.mark.parametrize(
+    "operation,simplified_query,execute_sql",
+    [
+        # Flattened
+        (
+            lambda df: df.order_by(col("A")).select(col("B") + 1),
+            'SELECT ("B" + 1{POSTFIX}) FROM ( SELECT $1 AS "A", $2 AS "B" FROM  VALUES (1 :: INT, -2 :: INT), (3 :: INT, -4 :: INT)) ORDER BY "A" ASC NULLS FIRST',
+            True,
+        ),
+        # Not flattened because SEQ1() is a data generator.
+        (
+            lambda df: df.order_by(col("A")).select(seq1(0)),
+            'SELECT seq1(0) FROM ( SELECT "A", "B" FROM ( SELECT $1 AS "A", $2 AS "B" FROM  VALUES (1 :: INT, -2 :: INT), (3 :: INT, -4 :: INT)) ORDER BY "A" ASC NULLS FIRST)',
+            True,
+        ),
+        # Not flattened, unlike filter, current query takes precendence when there are duplicate column names from a ORDERBY clause
+        (
+            lambda df: df.order_by(col("A")).select((col("B") + 1).alias("A")),
+            'SELECT ("B" + 1{POSTFIX}) AS "A" FROM ( SELECT "A", "B" FROM ( SELECT $1 AS "A", $2 AS "B" FROM  VALUES (1 :: INT, -2 :: INT), (3 :: INT, -4 :: INT)) ORDER BY "A" ASC NULLS FIRST)',
+            True,
+        ),
+        # Not flattened, since we cannot detect dependent columns from sql_expr
+        (
+            lambda df: df.order_by(sql_expr("A")).select(col("B")),
+            'SELECT "B" FROM ( SELECT "A", "B" FROM ( SELECT $1 AS "A", $2 AS "B" FROM  VALUES (1 :: INT, -2 :: INT), (3 :: INT, -4 :: INT)) ORDER BY A ASC NULLS FIRST)',
+            True,
+        ),
+        # Not flattened, since we cannot flatten when the subquery uses positional parameter ($1)
+        (
+            lambda df: df.order_by(col("$1")).select(col("B")),
+            'SELECT "B" FROM ( SELECT  *  FROM ( SELECT "A", "B" FROM ( SELECT $1 AS "A", $2 AS "B" FROM  VALUES (1 :: INT, -2 :: INT), (3 :: INT, -4 :: INT))) ORDER BY "$1" ASC NULLS FIRST)',
+            True,
+        ),
+        # Not flattened, skip execution since this would result in SnowparkSQLException
+        (
+            lambda df: df.order_by(col("C")).select((col("A") + col("B")).alias("C")),
+            'SELECT ("A" + "B") AS "C" FROM ( SELECT "A", "B" FROM ( SELECT $1 AS "A", $2 AS "B" FROM  VALUES (1 :: INT, -2 :: INT), (3 :: INT, -4 :: INT)) ORDER BY "C" ASC NULLS FIRST)',
+            False,
+        ),
+        # Flattened
+        (
+            lambda df: df.order_by(col("A"))
+            .select(col("B"), col("A"))
+            .order_by(col("B"))
+            .select(col("A")),
+            'SELECT "A" FROM ( SELECT $1 AS "A", $2 AS "B" FROM  VALUES (1 :: INT, -2 :: INT), (3 :: INT, -4 :: INT)) ORDER BY "B" ASC NULLS FIRST, "A" ASC NULLS FIRST',
+            True,
+        ),
+    ],
+)
+def test_select_after_orderby(
+    setup_reduce_cast, session, operation, simplified_query, execute_sql
+):
+    session.sql_simplifier_enabled = False
+    df1 = session.create_dataframe([[1, -2], [3, -4]], schema=["a", "b"])
+
     session.sql_simplifier_enabled = True
-    df1 = session.sql("select 'a' as a")
-    df2 = df1.select(df1["A"] == math.nan)
-    assert df2._output[0].name == '"(""A"" = \'NAN\' :: FLOAT)"'
-    assert df2.columns[0] == '"(""A"" = \'NAN\' :: FLOAT)"'
+    df2 = session.create_dataframe([[1, -2], [3, -4]], schema=["a", "b"])
 
-
-def test_function_column_name(session):
-    session.sql_simplifier_enabled = True
-    df1 = session.sql("select 'a' as a")
-    df2 = df1.select(upper(df1["A"]))
-    assert df2._output[0].name == '"UPPER(""A"")"'
-    assert df2.columns[0] == '"UPPER(""A"")"'
-
-    df3 = df1.select(count_distinct("a"))
-    assert df3._output[0].name == '"COUNT( DISTINCT ""A"")"'
-    assert df3.columns[0] == '"COUNT( DISTINCT ""A"")"'
-
-
-def test_inf_column_name(session):
-    session.sql_simplifier_enabled = True
-    df1 = session.sql("select 'inf'")
-    df2 = df1.select(df1["'INF'"] == math.inf)
-    assert df2._output[0].name == '"(""\'INF\'"" = \'INF\' :: FLOAT)"'
-    assert df2.columns[0] == '"(""\'INF\'"" = \'INF\' :: FLOAT)"'
-
-
-def test_binary_operation_column_name(session):
-    session.sql_simplifier_enabled = True
-    df1 = session.table("dual")
-    df2 = df1.select(lit(1) + lit(2))
-    assert df2._output[0].name == '"(1 :: INT + 2 :: INT)"'
-    assert df2.columns[0] == '"(1 :: INT + 2 :: INT)"'
-
-
-def test_unary_operation_column_name(session):
-    session.sql_simplifier_enabled = True
-    df1 = session.table("dual")
-    df2 = df1.select(-lit(1))
-    assert df2._output[0].name == '"- 1 :: INT"'
-    assert df2.columns[0] == '"- 1 :: INT"'
-
-
-@pytest.mark.parametrize("use_qualified_name", [True, False])
-def test_udf_case_sensitive_column_name(session, use_qualified_name):
-    def add_one(x: int) -> int:
-        return x + 1
-
-    special_chars = "quoted_name"
-    temp_func_name = (
-        f'"{Utils.random_name_for_temp_object(TempObjectType.FUNCTION)}{special_chars}"'
+    integer_literal_postfix = (
+        "" if session.eliminate_numeric_sql_value_cast_enabled else " :: INT"
     )
-    perm_func_name = (
-        f'"{special_chars}{Utils.random_name_for_temp_object(TempObjectType.FUNCTION)}"'
+    simplified_query = simplified_query.format_map({"POSTFIX": integer_literal_postfix})
+
+    assert operation(df2).queries["queries"][0] == simplified_query
+    if execute_sql:
+        Utils.check_answer(operation(df1), operation(df2))
+
+
+def test_window_with_filter(session):
+    df = session.create_dataframe([[0], [1]], schema=["A"])
+    df = (
+        df.with_column("B", iff(df.A == 0, 10, 11))
+        .with_column("C", min_("B").over())
+        .filter(df.A == 1)
     )
-    stage_name = Utils.random_stage_name()
-    try:
-        Utils.create_stage(session, stage_name, is_temporary=False)
-        df = session.create_dataframe([1, 2], schema=["a"])
-        session.udf.register(add_one, name=temp_func_name, is_permanent=False)
-        session.udf.register(
-            add_one, name=perm_func_name, is_permanent=True, stage_location=stage_name
-        )
-        if use_qualified_name:
-            database_name = session.get_current_database()
-            schema_name = session.get_current_schema()
-            full_temp_func_name = f"{database_name}.{schema_name}.{temp_func_name}"
-            df_temp = df.select(call_udf(full_temp_func_name, col("a")))
-            assert (
-                df_temp._output[0].name
-                == f'""{database_name}"."{schema_name}"."{temp_func_name.upper()}"(""A"")"'
-            )
-            assert (
-                df_temp.columns[0]
-                == f'""{database_name}"."{schema_name}"."{temp_func_name.upper()}"(""A"")"'
-            )
+    Utils.check_answer(df, [Row(1, 11, 10)], sort=False)
 
-            full_perm_func_name = f"{session.get_current_database()}.{session.get_current_schema()}.{perm_func_name}"
-            df_perm = df.select(call_udf(full_perm_func_name, col("a")))
-            assert (
-                df_perm._output[0].name
-                == f'""{database_name}"."{schema_name}"."{perm_func_name.upper()}"(""A"")"'
-            )
-            assert (
-                df_perm.columns[0]
-                == f'""{database_name}"."{schema_name}"."{perm_func_name.upper()}"(""A"")"'
-            )
-        else:
-            df_temp = df.select(call_udf(temp_func_name, col("a")))
-            assert df_temp._output[0].name == f'""{temp_func_name.upper()}"(""A"")"'
-            assert df_temp.columns[0] == f'""{temp_func_name.upper()}"(""A"")"'
 
-            df_perm = df.select(call_udf(perm_func_name, col("a")))
-            assert df_perm._output[0].name == f'""{perm_func_name.upper()}"(""A"")"'
-            assert df_perm.columns[0] == f'""{perm_func_name.upper()}"(""A"")"'
-    finally:
-        session._run_query(f"drop function if exists {temp_func_name}(int)")
-        session._run_query(f"drop function if exists {perm_func_name}(int)")
-        Utils.drop_stage(session, stage_name)
+def test_data_generator_with_filter(session):
+    df = session.create_dataframe([[0], [1]], schema=["a"])
+    df = (
+        df.with_column("B", seq1()).with_column("C", min_("B").over()).filter(df.A == 1)
+    )
+    Utils.check_answer(df, [Row(1, 1, 0)])
+
+
+def test_star_column(session):
+    # convert to a table
+    df = session.create_dataframe(
+        [[0, "a"], [1, "b"]], schema=["a", "b"]
+    ).cache_result()
+    # select a column and rename it twice
+    df1 = df.select(col("a").as_("x"), "b").select(col("x").as_("y"), "b")
+    df2 = df1.select(object_construct_keep_null("*"))
+    # expect that no subquery is flattened
+    query = df2.queries["queries"][0]
+    assert query.count("SELECT") == 3
+    Utils.check_answer(
+        df2, [Row('{\n  "B": "a",\n  "Y": 0\n}'), Row('{\n  "B": "b",\n  "Y": 1\n}')]
+    )
+
+
+def test_select_limit_orderby(session):
+    # convert to a table
+    df = session.create_dataframe([[5, "a"], [3, "b"]], schema=["a", "b"])
+    # call sort after limit
+    df1 = df.select("a", "b").limit(2).sort(col("a"))
+    Utils.check_answer(df1, [Row(3, "b"), Row(5, "a")])
+    # sql simplification is not applied, and order by clause is attached at end
+    expected_query = """SELECT  *  FROM ( SELECT "A", "B" FROM ( SELECT $1 AS "A", $2 AS "B" FROM  VALUES (5 :: INT, 'a' :: STRING), (3 :: INT, 'b' :: STRING)) LIMIT 2) ORDER BY "A" ASC NULLS FIRST"""
+    assert df1.queries["queries"][0] == expected_query
+
+    df2 = df.select("a", "b").sort(col("a")).limit(2)
+    Utils.check_answer(df2, [Row(3, "b"), Row(5, "a")])
+    # sql simplification is applied, order by is in front of the limit
+    expected_query = """SELECT "A", "B" FROM ( SELECT $1 AS "A", $2 AS "B" FROM  VALUES (5 :: INT, 'a' :: STRING), (3 :: INT, 'b' :: STRING)) ORDER BY "A" ASC NULLS FIRST LIMIT 2"""
+    assert df2.queries["queries"][0] == expected_query
+
+    df3 = df.select("a", "b").limit(2, offset=1).sort(col("a"))
+    expected_query = """SELECT  *  FROM ( SELECT "A", "B" FROM ( SELECT $1 AS "A", $2 AS "B" FROM  VALUES (5 :: INT, 'a' :: STRING), (3 :: INT, 'b' :: STRING)) LIMIT 2 OFFSET 1) ORDER BY "A" ASC NULLS FIRST"""
+    assert df3.queries["queries"][0] == expected_query
+
+
+@pytest.mark.parametrize(
+    "operation,expected_query,expected_result,sort_results",
+    [
+        # df.select().distinct() != df.distinct().select()
+        (
+            lambda df: df.select("a", "b").distinct().select("a"),
+            lambda table: f"""SELECT "A" FROM ( SELECT  DISTINCT "A", "B" FROM {table})""",
+            [Row(5), Row(3), Row(1), Row(3)],
+            False,
+        ),
+        (
+            lambda df: df.select("a", "b").select("a").distinct(),
+            lambda table: f"""SELECT  DISTINCT "A" FROM {table}""",
+            [Row(5), Row(3), Row(1)],
+            False,
+        ),
+        # df.select().distinct().limit() != df.distinct().select().limit() for optimization
+        (
+            lambda df: df.select("a", "b").distinct().limit(4),
+            lambda table: f"""SELECT  DISTINCT "A", "B" FROM {table} LIMIT 4""",
+            [Row(5, "a"), Row(3, "b"), Row(1, "c"), Row(3, "c")],
+            False,
+        ),
+        (
+            lambda df: df.select("a", "b").limit(4).distinct(),
+            lambda table: f"""SELECT  DISTINCT  *  FROM ( SELECT "A", "B" FROM {table} LIMIT 4)""",
+            None,
+            False,
+        ),
+        # df.distinct().filter() = df.filter().distinct()
+        (
+            lambda df: df.select("a", "b").distinct().filter(col("a") > 1),
+            lambda table: f"""SELECT  DISTINCT "A", "B" FROM {table} WHERE ("A" > 1)""",
+            [Row(5, "a"), Row(3, "b"), Row(3, "c")],
+            False,
+        ),
+        (
+            lambda df: df.select("a", "b").filter(col("a") > 1).distinct(),
+            lambda table: f"""SELECT  DISTINCT "A", "B" FROM {table} WHERE ("A" > 1)""",
+            [Row(5, "a"), Row(3, "b"), Row(3, "c")],
+            False,
+        ),
+        # df.distinct().sort() = df.sort().distinct()
+        (
+            lambda df: df.select("a", "b").distinct().sort(col("a"), col("b")),
+            lambda table: f"""SELECT  DISTINCT "A", "B" FROM {table} ORDER BY "A" ASC NULLS FIRST, "B" ASC NULLS FIRST""",
+            [Row(1, "c"), Row(3, "b"), Row(3, "c"), Row(5, "a")],
+            True,
+        ),
+        (
+            lambda df: df.select("a", "b").sort(col("a"), col("b")).distinct(),
+            lambda table: f"""SELECT  DISTINCT "A", "B" FROM {table} ORDER BY "A" ASC NULLS FIRST, "B" ASC NULLS FIRST""",
+            [Row(1, "c"), Row(3, "b"), Row(3, "c"), Row(5, "a")],
+            True,
+        ),
+    ],
+)
+def test_select_distinct(
+    session, distinct_table, operation, expected_query, expected_result, sort_results
+):
+    df = session.table(distinct_table)
+    df1 = operation(df)
+    if expected_result is not None:
+        Utils.check_answer(df1, expected_result, sort=sort_results)
+    assert df1.queries["queries"][0] == expected_query(distinct_table)

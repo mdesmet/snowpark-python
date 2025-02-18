@@ -1,5 +1,5 @@
 #
-# Copyright (c) 2012-2022 Snowflake Computing Inc. All rights reserved.
+# Copyright (c) 2012-2025 Snowflake Computing Inc. All rights reserved.
 #
 
 import pytest
@@ -40,4 +40,4 @@ def test_mix_set_operator():
     assert ex_info.value.message.startswith("Unsupported using join type 'Cross'.")
     assert UsingJoin(create_join_type("inner"), ["col1"]).sql == "USING INNER"
 
-    assert Join(None, None, create_join_type("Inner"), None).sql == "INNER"
+    assert Join(None, None, create_join_type("Inner"), None, None).sql == "INNER"

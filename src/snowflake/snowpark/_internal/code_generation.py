@@ -1,5 +1,5 @@
 #
-# Copyright (c) 2012-2022 Snowflake Computing Inc. All rights reserved.
+# Copyright (c) 2012-2025 Snowflake Computing Inc. All rights reserved.
 #
 
 import ast
@@ -13,9 +13,17 @@ import textwrap
 from collections import defaultdict, namedtuple
 from logging import getLogger
 from types import BuiltinFunctionType, CodeType, FunctionType, ModuleType
-from typing import Any, Dict, Iterable, List, Set, Tuple, Union
+from typing import Any, Dict, List, Set, Tuple, Union
 
 import opcode
+
+# Python 3.8 needs to use typing.Iterable because collections.abc.Iterable is not subscriptable
+# Python 3.9 can use both
+# Python 3.10 needs to use collections.abc.Iterable because typing.Iterable is removed
+if sys.version_info <= (3, 9):
+    from typing import Iterable
+else:
+    from collections.abc import Iterable
 
 logger = getLogger(__name__)
 
@@ -172,12 +180,12 @@ def get_class_references(
 
 def extract_func_global_refs(code: CodeType) -> Set[str]:
     # inspired by cloudpickle to recursively extract all the global references used by the target func's code object
-    co_names = code.co_names
+    # check: https://github.com/cloudpipe/cloudpickle/commit/6a0e12d058d1bd3ab26ec000ac2249b4ee7e9c9f
     out_names = set()
     for instr in dis.get_instructions(code):
         op = instr.opcode
         if op in GLOBAL_OPS:
-            out_names.add(co_names[instr.arg])
+            out_names.add(instr.argval)
 
     if code.co_consts:
         for const in code.co_consts:

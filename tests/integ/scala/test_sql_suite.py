@@ -1,6 +1,7 @@
 #
-# Copyright (c) 2012-2022 Snowflake Computing Inc. All rights reserved.
+# Copyright (c) 2012-2025 Snowflake Computing Inc. All rights reserved.
 #
+
 import os
 
 import pytest
@@ -11,6 +12,14 @@ from snowflake.snowpark.exceptions import SnowparkSQLException
 from snowflake.snowpark.functions import col
 from snowflake.snowpark.types import LongType, StructField, StructType
 from tests.utils import IS_IN_STORED_PROC, TestFiles, Utils
+
+pytestmark = [
+    pytest.mark.xfail(
+        "config.getoption('local_testing_mode', default=False)",
+        reason="This is a SQL test suite",
+        run=False,
+    )
+]
 
 
 @pytest.mark.skipif(

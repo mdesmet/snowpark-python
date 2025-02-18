@@ -1,19 +1,20 @@
 #!/usr/bin/env python3
 #
-# Copyright (c) 2012-2022 Snowflake Computing Inc. All rights reserved.
+# Copyright (c) 2012-2025 Snowflake Computing Inc. All rights reserved.
 #
+
 from typing import NamedTuple
 
 import pytest
 
 from snowflake.connector.errors import DatabaseError
 from snowflake.snowpark import Row, Session
-from snowflake.snowpark._internal.analyzer.analyzer_utils import quote_name
 from snowflake.snowpark._internal.utils import (
     TempObjectType,
     get_application_name,
     get_python_version,
     get_version,
+    quote_name,
 )
 from snowflake.snowpark.exceptions import (
     SnowparkInvalidObjectNameException,
@@ -25,6 +26,11 @@ from snowflake.snowpark.types import IntegerType, StringType, StructField, Struc
 from tests.utils import IS_IN_STORED_PROC, IS_IN_STORED_PROC_LOCALFS, Utils
 
 
+@pytest.mark.xfail(
+    "config.getoption('local_testing_mode', default=False)",
+    reason="This is testing logging into Snowflake",
+    run=False,
+)
 @pytest.mark.skipif(
     IS_IN_STORED_PROC, reason="creating new session is not allowed in stored proc"
 )
@@ -43,7 +49,7 @@ def test_invalid_configs(session, db_parameters):
 
 
 @pytest.mark.skipif(IS_IN_STORED_PROC, reason="db_parameters is not available")
-def test_current_database_and_schema(session, db_parameters):
+def test_current_database_and_schema(session, db_parameters, local_testing_mode):
     database = quote_name(db_parameters["database"])
     schema = quote_name(db_parameters["schema"])
     assert Utils.equals_ignore_case(database, session.get_current_database())
@@ -51,7 +57,11 @@ def test_current_database_and_schema(session, db_parameters):
 
     schema_name = Utils.random_temp_schema()
     try:
-        session._run_query(f"create schema {schema_name}")
+        if not local_testing_mode:
+            session._run_query(f"create schema {schema_name}")
+        else:
+            # in local testing we assume schema is already created
+            session.use_schema(schema_name)
 
         assert Utils.equals_ignore_case(database, session.get_current_database())
         assert Utils.equals_ignore_case(
@@ -59,8 +69,9 @@ def test_current_database_and_schema(session, db_parameters):
         )
     finally:
         # restore
-        session._run_query(f"drop schema if exists {schema_name}")
-        session._run_query(f"use schema {schema}")
+        if not local_testing_mode:
+            session._run_query(f"drop schema if exists {schema_name}")
+            session._run_query(f"use schema {schema}")
 
 
 def test_quote_all_database_and_schema_names(session):
@@ -99,19 +110,26 @@ def test_create_dataframe_namedtuple(session):
 # this test requires the parameters used for connection has `public role`,
 # and the public role has the privilege to access the current database and
 # schema of the current role
+
+
 @pytest.mark.skipif(IS_IN_STORED_PROC, reason="Not enough privilege to run this test")
 def test_get_schema_database_works_after_use_role(session):
-    current_role = session._conn._get_string_datum("select current_role()")
+    current_role = session.get_current_role()
     try:
         db = session.get_current_database()
         schema = session.get_current_schema()
-        session._run_query("use role public")
+        session.use_role("public")
         assert session.get_current_database() == db
         assert session.get_current_schema() == schema
     finally:
-        session._run_query(f"use role {current_role}")
+        session.use_role(current_role)
 
 
+@pytest.mark.xfail(
+    "config.getoption('local_testing_mode', default=False)",
+    reason="_remove_config is an internal API and local testing has default schema name",
+    run=False,
+)
 @pytest.mark.skipif(
     IS_IN_STORED_PROC, reason="creating new session is not allowed in stored proc"
 )
@@ -124,13 +142,20 @@ def test_negative_test_for_missing_required_parameter_schema(
     new_session.sql_simplifier_enabled = sql_simplifier_enabled
     with new_session:
         with pytest.raises(SnowparkMissingDbOrSchemaException) as ex_info:
-            new_session.get_fully_qualified_current_schema()
+            new_session.get_fully_qualified_name_if_possible("table")
         assert "The SCHEMA is not set for the current session." in str(ex_info)
 
 
+@pytest.mark.xfail(
+    "config.getoption('local_testing_mode', default=False)",
+    reason="sql function call not supported by local testing.",
+    run=False,
+)
 @pytest.mark.skipif(IS_IN_STORED_PROC, reason="client is regression test specific")
 def test_select_current_client(session):
-    current_client = session.sql("select current_client()")._show_string(10)
+    current_client = session.sql("select current_client()")._show_string(
+        10, _emit_ast=session.ast_enabled
+    )
     assert get_application_name() in current_client
     assert get_version() in current_client
 
@@ -143,7 +168,7 @@ def test_negative_test_to_invalid_table_name(session):
     )
 
 
-def test_create_dataframe_from_seq_none(session):
+def test_create_dataframe_from_seq_none(session, local_testing_mode):
     assert session.create_dataframe([None, 1]).to_df("int").collect() == [
         Row(None),
         Row(1),
@@ -154,7 +179,8 @@ def test_create_dataframe_from_seq_none(session):
     ]
 
 
-def test_create_dataframe_from_array(session):
+# should be enabled after emulating snowflake types
+def test_create_dataframe_from_array(session, local_testing_mode):
     data = [Row(1, "a"), Row(2, "b")]
     schema = StructType(
         [StructField("num", IntegerType()), StructField("str", StringType())]
@@ -162,11 +188,13 @@ def test_create_dataframe_from_array(session):
     df = session.create_dataframe(data, schema)
     assert df.collect() == data
 
-    # negative
-    data1 = [Row("a", 1), Row(2, "b")]
-    with pytest.raises(TypeError) as ex_info:
-        session.create_dataframe(data1, schema)
-    assert "Unsupported datatype" in str(ex_info)
+    # local testing mode does not have strict type checking
+    if not local_testing_mode:
+        # negative
+        data1 = [Row("a", 1), Row(2, "b")]
+        with pytest.raises(TypeError) as ex_info:
+            session.create_dataframe(data1, schema)
+        assert "Unsupported datatype" in str(ex_info)
 
 
 @pytest.mark.skipif(
@@ -191,14 +219,13 @@ def test_dataframe_created_before_session_close_are_not_usable_after_closing_ses
 
 def test_load_table_from_array_multipart_identifier(session):
     name = Utils.random_name_for_temp_object(TempObjectType.TABLE)
-    try:
-        Utils.create_table(session, name, "col int")
-        db = session.get_current_database()
-        sc = session.get_current_schema()
-        multipart = [db, sc, name]
-        assert len(session.table(multipart).schema.fields) == 1
-    finally:
-        Utils.drop_table(session, name)
+    session.create_dataframe(
+        [], schema=StructType([StructField("col", IntegerType())])
+    ).write.save_as_table(name, table_type="temporary")
+    db = session.get_current_database()
+    sc = session.get_current_schema()
+    multipart = [db, sc, name]
+    assert len(session.table(multipart).schema.fields) == 1
 
 
 def test_session_info(session):
@@ -230,9 +257,13 @@ def test_dataframe_close_session(session, db_parameters):
     assert ex_info.value.error_code == "1404"
 
 
+@pytest.mark.xfail(
+    "config.getoption('local_testing_mode', default=False)",
+    reason="transactions not supported by local testing.",
+    run=False,
+)
 @pytest.mark.skipif(IS_IN_STORED_PROC_LOCALFS, reason="Large result")
-def test_create_temp_table_no_commit(session):
-    # test large local relation
+def test_large_local_relation_no_commit(session):
     session.sql("begin").collect()
     assert Utils.is_active_transaction(session)
     session.range(1000000).to_df("id").collect()
@@ -240,7 +271,23 @@ def test_create_temp_table_no_commit(session):
     session.sql("commit").collect()
     assert not Utils.is_active_transaction(session)
 
-    # test cache result
+
+@pytest.mark.xfail(
+    "config.getoption('local_testing_mode', default=False)",
+    reason="transactions not supported by local testing.",
+    run=False,
+)
+@pytest.mark.skipif(
+    IS_IN_STORED_PROC, reason="creating new session is not allowed in stored proc"
+)
+def test_create_temp_table_no_commit(
+    db_parameters,
+    sql_simplifier_enabled,
+):
+    session = Session.builder.configs(db_parameters).create()
+    session.sql_simplifier_enabled = sql_simplifier_enabled
+
+    # cache_result creates a temp table
     test_table = Utils.random_name_for_temp_object(TempObjectType.TABLE)
     try:
         Utils.create_table(session, test_table, "c1 int", is_temporary=True)
@@ -253,3 +300,4 @@ def test_create_temp_table_no_commit(session):
         assert not Utils.is_active_transaction(session)
     finally:
         Utils.drop_table(session, test_table)
+        session.close()

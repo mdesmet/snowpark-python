@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 #
-# Copyright (c) 2012-2022 Snowflake Computing Inc. All rights reserved.
+# Copyright (c) 2012-2025 Snowflake Computing Inc. All rights reserved.
 #
+
 """This package contains all Snowpark client-side exceptions."""
 import logging
 from typing import Optional
+
+from snowflake.connector.errors import Error as ConnectorError
 
 _logger = logging.getLogger(__name__)
 
@@ -15,6 +18,7 @@ class SnowparkClientException(Exception):
     def __init__(
         self,
         message: str,
+        *,
         error_code: Optional[str] = None,
     ) -> None:
         self.message: str = message
@@ -75,13 +79,21 @@ class SnowparkSQLException(SnowparkClientException):
     def __init__(
         self,
         message: str,
+        *,
         error_code: Optional[str] = None,
+        conn_error: Optional[ConnectorError] = None,
         sfqid: Optional[str] = None,
+        query: Optional[str] = None,
+        sql_error_code: Optional[int] = None,
+        raw_message: Optional[str] = None,
     ) -> None:
-        self.message: str = message
-        self.error_code: Optional[str] = error_code
-        self.sfqid: Optional[str] = sfqid
-        self.telemetry_message: str = message
+        super().__init__(message, error_code=error_code)
+
+        self.conn_error = conn_error
+        self.sfqid = sfqid or getattr(self.conn_error, "sfqid", None)
+        self.query = query or getattr(self.conn_error, "query", None)
+        self.sql_error_code = sql_error_code or getattr(self.conn_error, "errno", None)
+        self.raw_message = raw_message or getattr(self.conn_error, "raw_msg", None)
 
         pretty_error_code = f"({self.error_code}): " if self.error_code else ""
         pretty_sfqid = f"{self.sfqid}: " if self.sfqid else ""
@@ -158,6 +170,15 @@ class SnowparkCreateViewException(SnowparkPlanException):
     """Exception for errors while trying to create a view.
 
     Includes error codes: 1203, 1204, 1205, 1206.
+    """
+
+    pass
+
+
+class SnowparkCreateDynamicTableException(SnowparkPlanException):
+    """Exception for errors while trying to create a dynamic table.
+
+    Includes error codes: 1207, 1208.
     """
 
     pass

@@ -1,6 +1,7 @@
 #
-# Copyright (c) 2012-2022 Snowflake Computing Inc. All rights reserved.
+# Copyright (c) 2012-2025 Snowflake Computing Inc. All rights reserved.
 #
+
 import pytest
 
 from snowflake.connector.errors import ProgrammingError
@@ -10,6 +11,11 @@ from snowflake.snowpark._internal.utils import (
 )
 
 
+@pytest.mark.xfail(
+    "config.getoption('local_testing_mode', default=False)",
+    reason="SQL query not supported",
+    run=False,
+)
 def test_create_scoped_temp_objects_syntax(session):
     snowpark_temp_table_name = random_name_for_temp_object(TempObjectType.TABLE)
     session._run_query(

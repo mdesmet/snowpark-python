@@ -1,6 +1,7 @@
 #
-# Copyright (c) 2012-2022 Snowflake Computing Inc. All rights reserved.
+# Copyright (c) 2012-2025 Snowflake Computing Inc. All rights reserved.
 #
+
 import datetime
 import decimal
 import time
@@ -19,6 +20,7 @@ from snowflake.snowpark.types import (
     DoubleType,
     FloatType,
     GeographyType,
+    GeometryType,
     IntegerType,
     LongType,
     MapType,
@@ -29,11 +31,11 @@ from snowflake.snowpark.types import (
     TimestampType,
     TimeType,
     VariantType,
+    VectorType,
 )
-from tests.utils import IS_IN_STORED_PROC
 
 
-@pytest.mark.skipif(IS_IN_STORED_PROC, reason="flaky test in SP")
+@pytest.mark.xfail(reason="SNOW-754118 flaky test", strict=False)
 def test_to_local_iterator_should_not_load_all_data_at_once(session):
     df = (
         session.range(1000000)
@@ -90,6 +92,11 @@ def test_limit_on_order_by(session, is_sample_data_available):
         assert int(e1[0]) < int(e2[0])
 
 
+@pytest.mark.xfail(
+    "config.getoption('local_testing_mode', default=False)",
+    reason="This is testing SQL generation.",
+    run=False,
+)
 @pytest.mark.parametrize("use_scoped_temp_objects", [True, False])
 def test_create_dataframe_for_large_values_check_plan(session, use_scoped_temp_objects):
     origin_use_scoped_temp_objects_setting = session._use_scoped_temp_objects
@@ -181,6 +188,11 @@ def test_create_dataframe_for_large_values_basic_types(session):
     assert df.sort("id").collect() == large_data
 
 
+# TODO: enable for local testing after emulating sf data types
+@pytest.mark.skipif(
+    "config.getoption('local_testing_mode', default=False)",
+    reason="to_geography is not yet supported in local testing mode.",
+)
 def test_create_dataframe_for_large_values_array_map_variant(session):
     schema = StructType(
         [
@@ -189,15 +201,16 @@ def test_create_dataframe_for_large_values_array_map_variant(session):
             StructField("map", MapType(None, None)),
             StructField("variant", VariantType()),
             StructField("geography", GeographyType()),
+            StructField("geometry", GeometryType()),
         ]
     )
 
     row_count = 350
     large_data = [
-        Row(i, ["'", 2], {"'": 1}, {"a": "foo"}, "POINT(30 10)")
+        Row(i, ["'", 2], {"'": 1}, {"a": "foo"}, "POINT(30 10)", "POINT(20 81)")
         for i in range(row_count)
     ]
-    large_data.append(Row(row_count, None, None, None, None))
+    large_data.append(Row(row_count, None, None, None, None, None))
     df = session.create_dataframe(large_data, schema)
     assert [type(field.datatype) for field in df.schema.fields] == [
         LongType,
@@ -205,12 +218,21 @@ def test_create_dataframe_for_large_values_array_map_variant(session):
         MapType,
         VariantType,
         GeographyType,
+        GeometryType,
     ]
     geography_string = """\
 {
   "coordinates": [
     30,
     10
+  ],
+  "type": "Point"
+}"""
+    geometry_string = """\
+{
+  "coordinates": [
+    2.000000000000000e+01,
+    8.100000000000000e+01
   ],
   "type": "Point"
 }"""
@@ -221,8 +243,46 @@ def test_create_dataframe_for_large_values_array_map_variant(session):
             '{\n  "\'": 1\n}',
             '{\n  "a": "foo"\n}',
             geography_string,
+            geometry_string,
         )
         for i in range(row_count)
     ]
-    expected.append(Row(row_count, None, None, None, None))
+    expected.append(Row(row_count, None, None, None, None, None))
     assert df.sort("id").collect() == expected
+
+
+@pytest.mark.xfail(reason="SNOW-974852 vectors are not yet rolled out", strict=False)
+def test_create_dataframe_for_large_values_vector(session):
+    schema = StructType(
+        [
+            StructField("id", LongType()),
+            StructField("int_vector", VectorType(int, 5)),
+            StructField("float_vector", VectorType(float, 5)),
+        ]
+    )
+
+    row_count = 1000
+    large_data = [
+        Row(i, [1, 2, 3, 4, 5], [1.1, 2.2, 3.3, 4.4, 5.5]) for i in range(row_count)
+    ]
+    large_data.append(Row(row_count, None, None))
+    df = session.create_dataframe(large_data, schema)
+    assert [type(field.datatype) for field in df.schema.fields] == [
+        LongType,
+        VectorType,
+        VectorType,
+    ]
+
+    expected = [
+        Row(
+            i,
+            [1, 2, 3, 4, 5],
+            [1.1, 2.2, 3.3, 4.4, 5.5],
+        )
+        for i in range(row_count)
+    ]
+    expected.append(Row(row_count, None, None))
+    for i, row in enumerate(df.sort("id").collect()):
+        assert row[0] == expected[i][0]
+        assert row[1] == pytest.approx(expected[i][1])
+        assert row[2] == pytest.approx(expected[i][2])

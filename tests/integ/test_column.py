@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 #
-# Copyright (c) 2012-2022 Snowflake Computing Inc. All rights reserved.
+# Copyright (c) 2012-2025 Snowflake Computing Inc. All rights reserved.
 #
+
 import datetime
 import json
 
@@ -9,7 +10,7 @@ import pytest
 
 from snowflake.snowpark import Row
 from snowflake.snowpark.exceptions import SnowparkColumnException, SnowparkSQLException
-from snowflake.snowpark.functions import col, lit, parse_json, when
+from snowflake.snowpark.functions import col, lit, parse_json, when, hour, minute
 from tests.utils import TestData, Utils
 
 
@@ -52,11 +53,13 @@ def test_try_cast(session):
     assert cast_res[0][0] == try_cast_res[0][0] == datetime.date(2018, 1, 1)
 
 
-def test_try_cast_work_cast_not_work(session):
+def test_try_cast_work_cast_not_work(session, local_testing_mode):
     df = session.create_dataframe([["aaa"]], schema=["a"])
     with pytest.raises(SnowparkSQLException) as execinfo:
         df.select(df["a"].cast("date")).collect()
-    assert "Date 'aaa' is not recognized" in str(execinfo)
+    if not local_testing_mode:
+        assert "Date 'aaa' is not recognized" in str(execinfo)
+
     Utils.check_answer(
         df.select(df["a"].try_cast("date")), [Row(None)]
     )  # try_cast doesn't throw exception
@@ -117,6 +120,22 @@ def test_substring(session):
         sort=False,
     )
 
+    Utils.check_answer(
+        TestData.string4(session).select(
+            col("a").substring(0, 3), col("a").substr(1, 3)
+        ),
+        [Row("app", "app"), Row("ban", "ban"), Row("pea", "pea")],
+        sort=False,
+    )
+
+
+def test_contains(session):
+    Utils.check_answer(
+        TestData.string4(session).filter(col("a").contains(lit("e"))),
+        [Row("apple"), Row("peach")],
+        sort=False,
+    )
+
 
 def test_when_accept_literal_value(session):
     assert TestData.null_data1(session).select(
@@ -139,6 +158,39 @@ def test_logical_operator_raise_error(session):
     assert "Cannot convert a Column object into bool" in str(execinfo)
 
 
+def test_function_calls_inside_when(session):
+    df = session.create_dataframe(
+        [
+            (1, datetime.datetime(2020, 1, 1, 1, 1, 1)),
+            (1, datetime.datetime(2020, 1, 1, 23, 46, 1)),
+            (1, datetime.datetime(2020, 1, 1, 1, 46, 1)),
+        ],
+        schema=["id", "timestamp"],
+    )
+
+    df2 = df.withColumn(
+        "hour_rounded",
+        when(
+            minute("timestamp") > 45,
+            when(hour("timestamp") == 23, lit(0)).otherwise(hour("timestamp") + 1),
+        ).otherwise(hour("timestamp")),
+    )
+
+    Utils.check_answer(
+        df2,
+        [
+            Row(1, datetime.datetime(2020, 1, 1, 1, 1, 1), 1),
+            Row(1, datetime.datetime(2020, 1, 1, 23, 46, 1), 0),
+            Row(1, datetime.datetime(2020, 1, 1, 1, 46, 1), 2),
+        ],
+    )
+
+
+@pytest.mark.xfail(
+    "config.getoption('local_testing_mode', default=False)",
+    reason="SQL expr is not supported in Local Testing",
+    run=False,
+)
 def test_when_accept_sql_expr(session):
     assert TestData.null_data1(session).select(
         when("a is NULL", 5).when("a = 1", 6).otherwise(7).as_("a")
@@ -153,6 +205,10 @@ def test_when_accept_sql_expr(session):
     ).collect() == [Row(5), Row(None), Row(6), Row(None), Row(5)]
 
 
+@pytest.mark.skipif(
+    "config.getoption('local_testing_mode', default=False)",
+    reason="SNOW-1358930 TODO: Decimal should not be casted to int64",
+)
 def test_column_with_builtins_that_shadow_functions(session):
     conversion_error_msg_text = "Cannot convert a Column object into bool"
     iter_error_msg_text = "Column is not iterable. This error can occur when you use the Python built-ins for sum, min and max. Please make sure you use the corresponding function from snowflake.snowpark.functions."

@@ -1,19 +1,40 @@
 #!/usr/bin/env python3
 #
-# Copyright (c) 2012-2022 Snowflake Computing Inc. All rights reserved.
+# Copyright (c) 2012-2025 Snowflake Computing Inc. All rights reserved.
 #
-"""User-defined functions (UDFs) in Snowpark. Refer to :class:`~snowflake.snowpark.udf.UDFRegistration` for details and sample code."""
+
+"""User-defined functions (UDFs) in Snowpark. Please see `Python UDFs <https://docs.snowflake.com/en/developer-guide/snowpark/python/creating-udfs>`_ for details.
+Furthermore, there is vectorized UDF (Please see `Python UDF Batch API <https://docs.snowflake.com/en/developer-guide/udf/python/udf-python-batch.html>`__ for details). Compared to the default row-by-row processing pattern of a normal UDF, which sometimes is
+inefficient, a vectorized UDF allows vectorized operations on a dataframe, with the input as a `pandas DataFrame <https://pandas.pydata.org/docs/reference/api/pandas.DataFrame.html>`_ or `pandas Series <https://pandas.pydata.org/docs/reference/api/pandas.Series.html>`_. In a
+vectorized UDF, you can operate on a batches of rows by handling pandas DataFrame or pandas Series.
+
+In brief, the advantages of a vectorized UDF include
+    - The potential for better performance if your Python code operates efficiently on batches of rows.
+    - Less transformation logic is required if you are calling into libraries that operate on pandas DataFrames or pandas arrays.
+
+Refer to :class:`~snowflake.snowpark.udf.UDFRegistration` for sample code on how to create and use regular and vectorized UDF's using Snowpark Python API.
+"""
 import sys
 from types import ModuleType
-from typing import Callable, Dict, Iterable, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import snowflake.snowpark
+import snowflake.snowpark._internal.proto.generated.ast_pb2 as proto
 from snowflake.connector import ProgrammingError
 from snowflake.snowpark._internal.analyzer.expression import Expression, SnowflakeUDF
+from snowflake.snowpark._internal.ast.utils import (
+    build_udf,
+    build_udf_apply,
+    with_src_position,
+)
 from snowflake.snowpark._internal.error_message import SnowparkClientExceptionMessages
+from snowflake.snowpark._internal.open_telemetry import (
+    open_telemetry_udf_context_manager,
+)
 from snowflake.snowpark._internal.type_utils import ColumnOrName, convert_sp_to_sf_type
 from snowflake.snowpark._internal.udf_utils import (
     UDFColumn,
+    check_python_runtime_version,
     check_register_args,
     cleanup_failed_permanent_registration,
     create_python_udf_or_sp,
@@ -23,11 +44,21 @@ from snowflake.snowpark._internal.udf_utils import (
 )
 from snowflake.snowpark._internal.utils import (
     TempObjectType,
+    check_imports_type,
     parse_positional_args_to_list,
+    publicapi,
     warning,
 )
 from snowflake.snowpark.column import Column
 from snowflake.snowpark.types import DataType
+
+# Python 3.8 needs to use typing.Iterable because collections.abc.Iterable is not subscriptable
+# Python 3.9 can use both
+# Python 3.10 needs to use collections.abc.Iterable because typing.Iterable is removed
+if sys.version_info <= (3, 9):
+    from typing import Iterable
+else:
+    from collections.abc import Iterable
 
 
 class UserDefinedFunction:
@@ -53,6 +84,9 @@ class UserDefinedFunction:
         input_types: List[DataType],
         name: str,
         is_return_nullable: bool = False,
+        packages: Optional[List[Union[str, ModuleType]]] = None,
+        _ast: Optional[proto.Udf] = None,
+        _ast_id: Optional[int] = None,
     ) -> None:
         #: The Python function or a tuple containing the Python file path and the function name.
         self.func: Union[Callable, Tuple[str, str]] = func
@@ -62,10 +96,14 @@ class UserDefinedFunction:
         self._return_type = return_type
         self._input_types = input_types
         self._is_return_nullable = is_return_nullable
+        self._packages = packages
+
+        # If None, no ast will be emitted. Else, passed whenever udf is invoked.
+        self._ast = _ast
+        self._ast_id = _ast_id
 
     def __call__(
-        self,
-        *cols: Union[ColumnOrName, Iterable[ColumnOrName]],
+        self, *cols: Union[ColumnOrName, Iterable[ColumnOrName]], _emit_ast: bool = True
     ) -> Column:
         if len(cols) >= 1 and isinstance(cols[0], (list, tuple)):
             warning(
@@ -85,13 +123,26 @@ class UserDefinedFunction:
                     f"The input of UDF {self.name} must be Column, column name, or a list of them"
                 )
 
-        return Column(self._create_udf_expression(exprs))
+        udf_expr = None
+        if _emit_ast and self._ast is not None:
+            assert (
+                self._ast is not None
+            ), "Need to ensure _emit_ast is True when registering UDF."
+            assert self._ast_id is not None, "Need to assign UDF an ID."
+            udf_expr = proto.Expr()
+            build_udf_apply(udf_expr, self._ast_id, *cols)
+
+        ans = Column(self._create_udf_expression(exprs), _emit_ast=False)
+        ans._ast = udf_expr
+        return ans
 
     def _create_udf_expression(self, exprs: List[Expression]) -> SnowflakeUDF:
-        if len(exprs) != len(self._input_types):
+        # len(exprs) can be less than len(self._input_types) if udf has
+        # optional arguments but it cannot have more arguments
+        if len(exprs) > len(self._input_types):
             raise ValueError(
                 f"Incorrect number of arguments passed to the UDF:"
-                f" Expected: {len(exprs)}, Found: {len(self._input_types)}"
+                f" Expected: <={len(self._input_types)}, Found: {len(exprs)}"
             )
         return SnowflakeUDF(
             self.name,
@@ -111,16 +162,6 @@ class UDFRegistration:
     You can use this object to register UDFs that you plan to use in the current session or
     permanently. The methods that register a UDF return a :class:`UserDefinedFunction` object,
     which you can also use in :class:`~snowflake.snowpark.Column` expressions.
-
-    Note:
-        Before creating a UDF, think about whether you want to create a vectorized UDF (also referred to as `Python UDF Batch API`) or a regular UDF.
-        The advantages of a vectorized UDF are:
-
-          - The potential for better performance if your Python code operates efficiently on batches of rows.
-          - Less transformation logic is required if you are calling into libraries that operate on Pandas DataFrames or Pandas arrays.
-
-        Refer to `Python UDF Batch API <https://docs.snowflake.com/en/developer-guide/udf/python/udf-python-batch.html>`__ for more details.
-        The following text explains how to create a regular UDF and a vectorized UDF by using the Snowpark Python APIs.
 
     There are two ways to register a UDF with Snowpark:
 
@@ -190,17 +231,13 @@ class UDFRegistration:
           Therefore, this approach is useful and efficient when all your Python code is already in
           source files.
 
-    Compared to the default row-by-row processing pattern of a normal UDF, which sometimes is
-    inefficient, a vectorized UDF allows vectorized operations on a dataframe, with the input as a
-    `Pandas DataFrame <https://pandas.pydata.org/docs/reference/api/pandas.DataFrame.html>`_
-    or `Pandas Series <https://pandas.pydata.org/docs/reference/api/pandas.Series.html>`_. In a
-    vectorized UDF, you can operate on a batches of rows by handling Pandas DataFrame or Pandas
-    Series. You can use :func:`~snowflake.snowpark.functions.udf`, :meth:`register` or
-    :func:`~snowflake.snowpark.functions.pandas_udf` to create a vectorized UDF by providing
-    appropriate return and input types. If you would like to use :meth:`register_from_file` to
-    create a vectorized UDF, you should follow the guide of
-    `Python UDF Batch API <https://docs.snowflake.com/en/developer-guide/udf/python/udf-python-batch.html>`_ in
-    your Python source files. See Example 9, 10 and 11 here for registering a vectorized UDF.
+
+    For a vectorized UDF:
+        You can use :func:`~snowflake.snowpark.functions.udf`, :meth:`register` or
+        :func:`~snowflake.snowpark.functions.pandas_udf` to create a vectorized UDF by providing
+        appropriate return and input types. If you would like to use :meth:`register_from_file` to
+        create a vectorized UDF, you need to explicitly mark the handler function as vectorized using
+        either the `vectorized` Decorator or a function attribute.
 
     Snowflake supports the following data types for the parameters for a UDF:
 
@@ -239,11 +276,16 @@ class UDFRegistration:
         string.
 
         3. :class:`~snowflake.snowpark.types.PandasSeriesType` and
-        :class:`~snowflake.snowpark.types.PandasDataFrameType` are used when creating a Pandas
+        :class:`~snowflake.snowpark.types.PandasDataFrameType` are used when creating a pandas
         (vectorized) UDF, so they are not mapped to any SQL types. ``element_type`` in
         :class:`~snowflake.snowpark.types.PandasSeriesType` and ``col_types`` in
         :class:`~snowflake.snowpark.types.PandasDataFrameType` indicate the SQL types
-        in a Pandas Series and a Pandas DataFrame.
+        in a pandas Series and a pandas DataFrame.
+
+        4. To annotate the Snowflake specific Timestamp type (TIMESTAMP_NTZ, TIMESTAMP_LTZ and
+        TIMESTAMP_TZ), use :class:`~snowflake.snowpark.types.Timestamp` with
+        :class:`~snowflake.snowpark.types.NTZ`, :class:`~snowflake.snowpark.types.LTZ`,
+        :class:`~snowflake.snowpark.types.TZ` (e.g., ``Timestamp[NTZ]``).
 
     Example 1
         Create a temporary UDF from a lambda and apply it to a dataframe::
@@ -276,13 +318,26 @@ class UDFRegistration:
             ...     is_permanent=True, name="mul", replace=True,
             ...     stage_location="@mystage",
             ... )
-            >>> session.sql("select mul(5, 6)").show()
-            ---------------
-            |"MUL(5, 6)"  |
-            ---------------
-            |30           |
-            ---------------
-            <BLANKLINE>
+            >>> session.sql("select mul(5, 6) as mul").collect()
+            [Row(MUL=30)]
+            >>> # skip udf creation if it already exists
+            >>> _ = session.udf.register(
+            ...     lambda x, y: x * y + 1, return_type=IntegerType(),
+            ...     input_types=[IntegerType(), IntegerType()],
+            ...     is_permanent=True, name="mul", if_not_exists=True,
+            ...     stage_location="@mystage",
+            ... )
+            >>> session.sql("select mul(5, 6) as mul").collect()
+            [Row(MUL=30)]
+            >>> # overwrite udf definition when it already exists
+            >>> _ = session.udf.register(
+            ...     lambda x, y: x * y + 1, return_type=IntegerType(),
+            ...     input_types=[IntegerType(), IntegerType()],
+            ...     is_permanent=True, name="mul", replace=True,
+            ...     stage_location="@mystage",
+            ... )
+            >>> session.sql("select mul(5, 6) as mul").collect()
+            [Row(MUL=31)]
 
     Example 4
         Create a UDF with UDF-level imports and apply it to a dataframe::
@@ -436,7 +491,7 @@ class UDFRegistration:
         - :meth:`~snowflake.snowpark.Session.add_packages`
     """
 
-    def __init__(self, session: "snowflake.snowpark.session.Session") -> None:
+    def __init__(self, session: Optional["snowflake.snowpark.session.Session"]) -> None:
         self._session = session
 
     def describe(
@@ -454,6 +509,7 @@ class UDFRegistration:
             f"describe function {udf_obj.name}({','.join(func_args)})"
         )
 
+    @publicapi
     def register(
         self,
         func: Callable,
@@ -465,13 +521,20 @@ class UDFRegistration:
         imports: Optional[List[Union[str, Tuple[str, str]]]] = None,
         packages: Optional[List[Union[str, ModuleType]]] = None,
         replace: bool = False,
+        if_not_exists: bool = False,
         parallel: int = 4,
         max_batch_size: Optional[int] = None,
         strict: bool = False,
         secure: bool = False,
+        external_access_integrations: Optional[List[str]] = None,
+        secrets: Optional[Dict[str, str]] = None,
+        immutable: bool = False,
+        comment: Optional[str] = None,
+        copy_grants: bool = False,
         *,
         statement_params: Optional[Dict[str, str]] = None,
         source_code_display: bool = True,
+        _emit_ast: bool = True,
         **kwargs,
     ) -> UserDefinedFunction:
         """
@@ -516,17 +579,22 @@ class UDFRegistration:
                 :meth:`~snowflake.snowpark.Session.add_packages` and
                 :meth:`~snowflake.snowpark.Session.add_requirements`. Note that an empty list means
                 no package for this UDF, and ``None`` or not specifying this parameter means using
-                session-level packages.
+                session-level packages. To use Python packages that are not available in Snowflake,
+                refer to :meth:`~snowflake.snowpark.Session.custom_package_usage_config`.
             replace: Whether to replace a UDF that already was registered. The default is ``False``.
                 If it is ``False``, attempting to register a UDF with a name that already exists
                 results in a ``SnowparkSQLException`` exception being thrown. If it is ``True``,
                 an existing UDF with the same name is overwritten.
+            if_not_exists: Whether to skip creation of a UDF when one with the same signature already exists.
+                The default is ``False``. ``if_not_exists`` and ``replace`` are mutually exclusive
+                and a ``ValueError`` is raised when both are set. If it is ``True`` and a UDF with
+                the same signature exists, the UDF creation is skipped.
             parallel: The number of threads to use for uploading UDF files with the
                 `PUT <https://docs.snowflake.com/en/sql-reference/sql/put.html#put>`_
                 command. The default value is 4 and supported values are from 1 to 99.
                 Increasing the number of threads can improve performance when uploading
                 large UDF files.
-            max_batch_size: The maximum number of rows per input Pandas DataFrame or Pandas Series
+            max_batch_size: The maximum number of rows per input pandas DataFrame or pandas Series
                 inside a vectorized UDF. Because a vectorized UDF will be executed within a time limit,
                 which is `60` seconds, this optional argument can be used to reduce the running time of
                 every batch by setting a smaller batch size. Note that setting a larger value does not
@@ -542,44 +610,69 @@ class UDFRegistration:
                 The source code is dynamically generated therefore it may not be identical to how the
                 `func` is originally defined. The default is ``True``.
                 If it is ``False``, source code will not be generated or displayed.
+            external_access_integrations: The names of one or more external access integrations. Each
+                integration you specify allows access to the external network locations and secrets
+                the integration specifies.
+            secrets: The key-value pairs of string types of secrets used to authenticate the external network location.
+                The secrets can be accessed from handler code. The secrets specified as values must
+                also be specified in the external access integration and the keys are strings used to
+                retrieve the secrets using secret API.
+            immutable: Whether the UDF result is deterministic or not for the same input.
+            comment: Adds a comment for the created object. See
+                `COMMENT <https://docs.snowflake.com/en/sql-reference/sql/comment>`_
+            copy_grants: Specifies to retain the access privileges from the original function when a new function is created
+                using CREATE OR REPLACE FUNCTION.
 
         See Also:
-            - :func:`~snowflake.snowpark.functions.udf`
-            - :meth:`register_from_file`
+        - :func:`~snowflake.snowpark.functions.udf`
+        - :meth:`register_from_file`
         """
-        if not callable(func):
-            raise TypeError(
-                "Invalid function: not a function or callable "
-                f"(__call__ is not defined): {type(func)}"
+        with open_telemetry_udf_context_manager(self.register, func=func, name=name):
+            if not callable(func) and kwargs.get("_registered_object_name") is None:
+                raise TypeError(
+                    "Invalid function: not a function or callable "
+                    f"(__call__ is not defined): {type(func)}"
+                )
+
+            check_register_args(
+                TempObjectType.FUNCTION, name, is_permanent, stage_location, parallel
             )
 
-        check_register_args(
-            TempObjectType.FUNCTION, name, is_permanent, stage_location, parallel
-        )
+            _from_pandas = kwargs.get("_from_pandas_udf_function", False)
+            native_app_params = kwargs.pop("native_app_params", None)
 
-        _from_pandas = kwargs.get("_from_pandas_udf_function", False)
+            # register udf
+            return self._do_register_udf(
+                func,
+                return_type,
+                input_types,
+                name,
+                stage_location,
+                imports,
+                packages,
+                replace,
+                if_not_exists,
+                parallel,
+                max_batch_size,
+                _from_pandas,
+                strict,
+                secure,
+                external_access_integrations=external_access_integrations,
+                secrets=secrets,
+                immutable=immutable,
+                comment=comment,
+                native_app_params=native_app_params,
+                statement_params=statement_params,
+                source_code_display=source_code_display,
+                api_call_source="UDFRegistration.register"
+                + ("[pandas_udf]" if _from_pandas else ""),
+                is_permanent=is_permanent,
+                copy_grants=copy_grants,
+                _emit_ast=_emit_ast,
+                **kwargs,
+            )
 
-        # register udf
-        return self._do_register_udf(
-            func,
-            return_type,
-            input_types,
-            name,
-            stage_location,
-            imports,
-            packages,
-            replace,
-            parallel,
-            max_batch_size,
-            _from_pandas,
-            strict,
-            secure,
-            statement_params=statement_params,
-            source_code_display=source_code_display,
-            api_call_source="UDFRegistration.register"
-            + ("[pandas_udf]" if _from_pandas else ""),
-        )
-
+    @publicapi
     def register_from_file(
         self,
         file_path: str,
@@ -592,12 +685,20 @@ class UDFRegistration:
         imports: Optional[List[Union[str, Tuple[str, str]]]] = None,
         packages: Optional[List[Union[str, ModuleType]]] = None,
         replace: bool = False,
+        if_not_exists: bool = False,
         parallel: int = 4,
         strict: bool = False,
         secure: bool = False,
+        external_access_integrations: Optional[List[str]] = None,
+        secrets: Optional[Dict[str, str]] = None,
+        immutable: bool = False,
+        comment: Optional[str] = None,
+        copy_grants: bool = False,
         *,
         statement_params: Optional[Dict[str, str]] = None,
         source_code_display: bool = True,
+        skip_upload_on_content_match: bool = False,
+        _emit_ast: bool = True,
     ) -> UserDefinedFunction:
         """
         Registers a Python function as a Snowflake Python UDF from a Python or zip file,
@@ -647,11 +748,16 @@ class UDFRegistration:
                 :meth:`~snowflake.snowpark.Session.add_packages` and
                 :meth:`~snowflake.snowpark.Session.add_requirements`. Note that an empty list means
                 no package for this UDF, and ``None`` or not specifying this parameter means using
-                session-level packages.
+                session-level packages. To use Python packages that are not available in Snowflake,
+                refer to :meth:`~snowflake.snowpark.Session.custom_package_usage_config`.
             replace: Whether to replace a UDF that already was registered. The default is ``False``.
                 If it is ``False``, attempting to register a UDF with a name that already exists
                 results in a ``SnowparkSQLException`` exception being thrown. If it is ``True``,
                 an existing UDF with the same name is overwritten.
+            if_not_exists: Whether to skip creation of a UDF when one with the same signature already exists.
+                The default is ``False``. ``if_not_exists`` and ``replace`` are mutually exclusive
+                and a ``ValueError`` is raised when both are set. If it is ``True`` and a UDF with
+                the same signature exists, the UDF creation is skipped.
             parallel: The number of threads to use for uploading UDF files with the
                 `PUT <https://docs.snowflake.com/en/sql-reference/sql/put.html#put>`_
                 command. The default value is 4 and supported values are from 1 to 99.
@@ -667,39 +773,66 @@ class UDFRegistration:
                 The source code is dynamically generated therefore it may not be identical to how the
                 `func` is originally defined. The default is ``True``.
                 If it is ``False``, source code will not be generated or displayed.
+            skip_upload_on_content_match: When set to ``True`` and a version of source file already exists on stage, the given source
+                file will be uploaded to stage only if the contents of the current file differ from the remote file on stage. Defaults
+                to ``False``.
+            external_access_integrations: The names of one or more external access integrations. Each
+                integration you specify allows access to the external network locations and secrets
+                the integration specifies.
+            secrets: The key-value pairs of string types of secrets used to authenticate the external network location.
+                The secrets can be accessed from handler code. The secrets specified as values must
+                also be specified in the external access integration and the keys are strings used to
+                retrieve the secrets using secret API.
+            immutable: Whether the UDF result is deterministic or not for the same input.
+            comment: Adds a comment for the created object. See
+                `COMMENT <https://docs.snowflake.com/en/sql-reference/sql/comment>`_
+            copy_grants: Specifies to retain the access privileges from the original function when a new function is created
+                using CREATE OR REPLACE FUNCTION.
 
         Note::
-            The type hints can still be extracted from the source Python file if they
-            are provided, but currently are not working for a zip file. Therefore,
+            The type hints can still be extracted from the local source Python file if they
+            are provided, but currently are not working for a zip file or a remote file. Therefore,
             you have to provide ``return_type`` and ``input_types`` when ``path``
-            points to a zip file.
+            points to a zip file or a remote file.
 
         See Also:
             - :func:`~snowflake.snowpark.functions.udf`
             - :meth:`register`
         """
-        file_path = process_file_path(file_path)
-        check_register_args(
-            TempObjectType.FUNCTION, name, is_permanent, stage_location, parallel
-        )
+        with open_telemetry_udf_context_manager(
+            self.register_from_file, file_path=file_path, func_name=func_name, name=name
+        ):
+            file_path = process_file_path(file_path)
+            check_register_args(
+                TempObjectType.FUNCTION, name, is_permanent, stage_location, parallel
+            )
 
-        # register udf
-        return self._do_register_udf(
-            (file_path, func_name),
-            return_type,
-            input_types,
-            name,
-            stage_location,
-            imports,
-            packages,
-            replace,
-            parallel,
-            strict,
-            secure,
-            statement_params=statement_params,
-            source_code_display=source_code_display,
-            api_call_source="UDFRegistration.register_from_file",
-        )
+            # register udf
+            return self._do_register_udf(
+                (file_path, func_name),
+                return_type,
+                input_types,
+                name,
+                stage_location,
+                imports,
+                packages,
+                replace,
+                if_not_exists,
+                parallel,
+                strict,
+                secure,
+                external_access_integrations=external_access_integrations,
+                secrets=secrets,
+                immutable=immutable,
+                comment=comment,
+                statement_params=statement_params,
+                source_code_display=source_code_display,
+                api_call_source="UDFRegistration.register_from_file",
+                skip_upload_on_content_match=skip_upload_on_content_match,
+                is_permanent=is_permanent,
+                copy_grants=copy_grants,
+                _emit_ast=_emit_ast,
+            )
 
     def _do_register_udf(
         self,
@@ -711,26 +844,88 @@ class UDFRegistration:
         imports: Optional[List[Union[str, Tuple[str, str]]]] = None,
         packages: Optional[List[Union[str, ModuleType]]] = None,
         replace: bool = False,
+        if_not_exists: bool = False,
         parallel: int = 4,
         max_batch_size: Optional[int] = None,
         from_pandas_udf_function: bool = False,
         strict: bool = False,
         secure: bool = False,
+        external_access_integrations: Optional[List[str]] = None,
+        secrets: Optional[Dict[str, str]] = None,
+        immutable: bool = False,
+        comment: Optional[str] = None,
         *,
+        native_app_params: Optional[Dict[str, Any]] = None,
         statement_params: Optional[Dict[str, str]] = None,
         source_code_display: bool = True,
         api_call_source: str,
+        skip_upload_on_content_match: bool = False,
+        is_permanent: bool = False,
+        copy_grants: bool = False,
+        _emit_ast: bool = True,
+        **kwargs,
     ) -> UserDefinedFunction:
-        # get the udf name, return and input types
+        ast, ast_id = None, None
+        if kwargs.get("_registered_object_name") is not None:
+            if _emit_ast:
+                stmt = self._session._ast_batch.assign()
+                ast = with_src_position(stmt.expr.udf, stmt)
+                ast_id = stmt.var_id.bitfield1
+
+            return UserDefinedFunction(
+                func,
+                return_type,
+                input_types or [],
+                kwargs["_registered_object_name"],
+                _ast=ast,
+                _ast_id=ast_id,
+            )
+
+        check_imports_type(imports, "udf-level")
+
+        # Retrieve the UDF name, return and input types.
         (
             udf_name,
             is_pandas_udf,
             is_dataframe_input,
             return_type,
             input_types,
+            opt_arg_defaults,
         ) = process_registration_inputs(
             self._session, TempObjectType.FUNCTION, func, return_type, input_types, name
         )
+
+        # Capture original parameters.
+        if _emit_ast:
+            stmt = self._session._ast_batch.assign()
+            ast = with_src_position(stmt.expr.udf, stmt)
+            ast_id = stmt.var_id.bitfield1
+            build_udf(
+                ast,
+                func,
+                return_type=return_type,
+                input_types=input_types,
+                name=name,
+                stage_location=stage_location,
+                imports=imports,
+                packages=packages,
+                replace=replace,
+                if_not_exists=if_not_exists,
+                parallel=parallel,
+                max_batch_size=max_batch_size,
+                strict=strict,
+                secure=secure,
+                external_access_integrations=external_access_integrations,
+                secrets=secrets,
+                immutable=immutable,
+                comment=comment,
+                statement_params=statement_params,
+                source_code_display=source_code_display,
+                is_permanent=is_permanent,
+                session=self._session,
+                _registered_object_name=udf_name,
+                **kwargs,
+            )
 
         arg_names = [f"arg{i + 1}" for i in range(len(input_types))]
         input_args = [
@@ -751,6 +946,7 @@ class UDFRegistration:
             all_imports,
             all_packages,
             upload_file_stage_location,
+            custom_python_runtime_version_allowed,
         ) = resolve_imports_and_packages(
             self._session,
             TempObjectType.FUNCTION,
@@ -766,25 +962,48 @@ class UDFRegistration:
             max_batch_size,
             statement_params=statement_params,
             source_code_display=source_code_display,
+            skip_upload_on_content_match=skip_upload_on_content_match,
+            is_permanent=is_permanent,
         )
+
+        runtime_version_from_requirement = None
+        if self._session is not None:
+            runtime_version_from_requirement = (
+                self._session._runtime_version_from_requirement
+            )
+
+        if not custom_python_runtime_version_allowed:
+            check_python_runtime_version(runtime_version_from_requirement)
 
         raised = False
         try:
             create_python_udf_or_sp(
                 session=self._session,
+                func=func,
                 return_type=return_type,
                 input_args=input_args,
+                opt_arg_defaults=opt_arg_defaults,
                 handler=handler,
                 object_type=TempObjectType.FUNCTION,
                 object_name=udf_name,
                 all_imports=all_imports,
                 all_packages=all_packages,
-                is_temporary=stage_location is None,
+                raw_imports=imports,
+                is_permanent=is_permanent,
                 replace=replace,
+                if_not_exists=if_not_exists,
                 inline_python_code=code,
                 api_call_source=api_call_source,
                 strict=strict,
                 secure=secure,
+                external_access_integrations=external_access_integrations,
+                secrets=secrets,
+                immutable=immutable,
+                statement_params=statement_params,
+                comment=comment,
+                native_app_params=native_app_params,
+                copy_grants=copy_grants,
+                runtime_version=runtime_version_from_requirement,
             )
         # an exception might happen during registering a udf
         # (e.g., a dependency might not be found on the stage),
@@ -806,4 +1025,14 @@ class UDFRegistration:
                     self._session, upload_file_stage_location, stage_location
                 )
 
-        return UserDefinedFunction(func, return_type, input_types, udf_name)
+        udf = UserDefinedFunction(
+            func,
+            return_type,
+            input_types,
+            udf_name,
+            packages=packages,
+            _ast=ast,
+            _ast_id=ast_id,
+        )
+
+        return udf

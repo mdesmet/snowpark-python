@@ -1,6 +1,7 @@
 #
-# Copyright (c) 2012-2022 Snowflake Computing Inc. All rights reserved.
+# Copyright (c) 2012-2025 Snowflake Computing Inc. All rights reserved.
 #
+
 import os.path
 
 import pytest
@@ -19,6 +20,14 @@ tmp_stage_name = Utils.random_name_for_temp_object(TempObjectType.STAGE)
 tmp_table_name = Utils.random_name_for_temp_object(TempObjectType.TABLE)
 tmp_full_types_table_name = Utils.random_name_for_temp_object(TempObjectType.TABLE)
 tmp_full_types_table_name2 = Utils.random_name_for_temp_object(TempObjectType.TABLE)
+
+pytestmark = [
+    pytest.mark.xfail(
+        "config.getoption('local_testing_mode', default=False)",
+        reason="This is a SQL test suite",
+        run=False,
+    )
+]
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -44,9 +53,9 @@ def setup(session):
     )
 
 
-@pytest.mark.skipif(IS_IN_STORED_PROC_LOCALFS, reason="Large result")
-def test_show_database_objects(session):
-    sqls = [
+@pytest.mark.parametrize(
+    "sql",
+    (
         "show schemas",
         "show objects",
         "show external tables",
@@ -62,15 +71,20 @@ def test_show_database_objects(session):
         "show external functions",
         "show procedures",
         "show tables",
-        "show parameters",
+        pytest.param("show parameters", marks=pytest.mark.xfail),
         "show shares",
         "show warehouses",
         "show transactions",
         "show locks",
         "show regions",
-    ]
-    for sql in sqls:
-        Utils.verify_schema(sql, session.sql(sql).schema, session)
+    ),
+)
+@pytest.mark.skipif(IS_IN_STORED_PROC_LOCALFS, reason="Large result")
+def test_show_database_objects(
+    session,
+    sql,
+):
+    Utils.verify_schema(sql, session.sql(sql).schema, session)
 
 
 @pytest.mark.skipif(IS_IN_STORED_PROC_LOCALFS, reason="Large result")

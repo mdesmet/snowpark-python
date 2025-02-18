@@ -1,11 +1,12 @@
 #
-# Copyright (c) 2012-2022 Snowflake Computing Inc. All rights reserved.
+# Copyright (c) 2012-2025 Snowflake Computing Inc. All rights reserved.
 #
 
 import datetime
 import decimal
+import sys
 from collections import Counter
-from typing import Dict, Iterable, List, Tuple
+from typing import Dict, List, Tuple
 
 import pytest
 
@@ -22,21 +23,42 @@ from snowflake.snowpark.types import (
     StructType,
     Variant,
 )
+
 from tests.utils import Utils
+
+# Python 3.8 needs to use typing.Iterable because collections.abc.Iterable is not subscriptable
+# Python 3.9 can use both
+# Python 3.10 needs to use collections.abc.Iterable because typing.Iterable is removed
+if sys.version_info <= (3, 9):
+    from typing import Iterable
+else:
+    from collections.abc import Iterable
+
+pytestmark = [
+    pytest.mark.udf,
+    pytest.mark.skipif(
+        "config.getoption('local_testing_mode', default=False)",
+        reason="UDTF is not supported in Local Testing",
+    ),
+]
 
 wordcount_table_name = Utils.random_table_name()
 
 
 @pytest.fixture(scope="module", autouse=True)
-def setup_data(session):
-    session.create_dataframe(
-        [("w1 w2", "g1"), ("w1 w1 w1", "g2")], schema=["c1", "c2"]
-    ).write.save_as_table(wordcount_table_name)
+def setup_data(session, validate_ast):
+    df = session.sql(
+        "SELECT $1 AS \"C1\", $2 AS \"C2\" FROM  VALUES ('w1 w2', 'g1'), ('w1 w1 w1', 'g2')"
+    )
+    df.write.save_as_table(
+        wordcount_table_name,
+        mode="ignore" if validate_ast else "errorifexists",
+    )
     yield
     Utils.drop_table(session, wordcount_table_name)
 
 
-def test_basic_udtf_word_count_without_end_partition(session):
+def test_basic_udtf_word_count_without_end_partition(session, validate_ast):
     func_name = Utils.random_function_name()
 
     class MyWordCount:
@@ -45,15 +67,21 @@ def test_basic_udtf_word_count_without_end_partition(session):
             return counter.items()
 
     wordcount_udtf = session.udtf.register(
-        MyWordCount, ["word", "count"], name=func_name, is_permanent=False, replace=True
-    )
-
-    wordcount_udtf_with_statemenet_params = session.udtf.register(
         MyWordCount,
         ["word", "count"],
         name=func_name,
         is_permanent=False,
-        replace=True,
+        replace=not validate_ast,
+        if_not_exists=validate_ast,
+    )
+
+    wordcount_udtf_with_statement_params = session.udtf.register(
+        MyWordCount,
+        ["word", "count"],
+        name=func_name,
+        is_permanent=False,
+        replace=not validate_ast,
+        if_not_exists=validate_ast,
         statement_params={"SF_PARTNER": "FAKE_PARTNER"},
     )
 
@@ -69,7 +97,7 @@ def test_basic_udtf_word_count_without_end_partition(session):
         assert df2.columns == ["WORD", "COUNT"]
 
         df2_with_statement_params = session.table_function(
-            wordcount_udtf_with_statemenet_params(lit("w1 w2 w2 w3 w3 w3"))
+            wordcount_udtf_with_statement_params(lit("w1 w2 w2 w3 w3 w3"))
         )
         Utils.check_answer(
             df2_with_statement_params,
@@ -171,7 +199,7 @@ def test_negative_test_with_invalid_output_column_name(session):
     with pytest.raises(SnowparkInvalidObjectNameException) as invalid_exp:
         session.udtf.register(
             MyInvalidNameUDTF,
-            output_schema=StructType([StructField("bad name", StringType())]),
+            output_schema=StructType([StructField("", StringType())]),
             input_types=[StringType()],
         )
     assert "is invalid" in invalid_exp.value.message
@@ -206,7 +234,7 @@ def test_negative_test_with_invalid_output_column_name(session):
     with pytest.raises(ValueError) as ve:
         session.udtf.register(MyWrongReturnTypeUDTF, output_schema=["c1"])
     assert (
-        "The return type hint for a UDTF handler must but a collection type. <class 'int'> is used."
+        "The return type hint for a UDTF handler must be a collection type or None or a PandasDataFrame. <class 'int'> is used."
         in str(ve.value)
     )
 
